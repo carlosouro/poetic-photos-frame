@@ -2,16 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 
-// Load environment variables
 dotenv.config();
 
-// Configuration
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH || './test-photos'; 
-const PHOTOS_JSON_PATH = process.env.PHOTOS_JSON_PATH || './photos.json';
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
-
-// Allowed image types
 const EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const BATCH_SIZE = 50; // Send photos to server in batches of 50 to reduce IPC overhead
 
 interface Photo {
     path: string;
@@ -22,19 +18,23 @@ interface Photo {
 const args = process.argv.slice(2);
 const isDefaultsMode = args.includes('--mode=defaults');
 
-console.log(`📷 Starting Indexer... Mode: [${isDefaultsMode ? 'DEFAULTS ONLY' : 'FULL LIBRARY'}]`);
+// Check if we are running as a child process with IPC
+const hasIPC = !!process.send;
 
-function scanDirectory(dir: string, fileList: Photo[] = []) {
-    if (!fs.existsSync(dir)) {
-        console.warn(`Path does not exist: ${dir}`);
-        return fileList;
-    }
+if (!hasIPC) {
+    console.warn("⚠️ Indexer running in standalone mode. No data will be sent to server.");
+}
+
+function scanDirectory(dir: string, batchBuffer: Photo[]) {
+    if (!fs.existsSync(dir)) return;
 
     try {
-        const files = fs.readdirSync(dir);
+        // CHANGE: Sort in reverse order immediately after reading.
+        // This ensures "2025" is processed before "2024", etc.
+        const files = fs.readdirSync(dir).sort().reverse();
 
         for (const file of files) {
-            // Skip hidden files
+            // Skip hidden files or Synology thumbnails (@eaDir)
             if (file.startsWith('.') || file.startsWith('@')) continue;
 
             const filePath = path.join(dir, file);
@@ -42,47 +42,49 @@ function scanDirectory(dir: string, fileList: Photo[] = []) {
 
             try {
                 stat = fs.statSync(filePath);
-            } catch (e) {
-                continue;
-            }
+            } catch (e) { continue; }
 
             if (stat.isDirectory()) {
-                scanDirectory(filePath, fileList);
+                scanDirectory(filePath, batchBuffer);
             } else {
                 const ext = path.extname(file).toLowerCase();
                 if (EXTENSIONS.has(ext)) {
-                    // CHANGE: Use mtime (Modified Time) to ensure correct dates
-                    fileList.push({
+                    const photo = {
                         path: filePath,
+                        // CHANGE: Use mtime (Modified Time) for correct photo dates
                         created: stat.mtime.toISOString()
-                    });
+                    };
+                    
+                    batchBuffer.push(photo);
+
+                    // If buffer is full, send to parent and clear
+                    if (batchBuffer.length >= BATCH_SIZE && hasIPC) {
+                        process.send!({ type: 'batch', photos: batchBuffer });
+                        batchBuffer.length = 0; // Clear array
+                    }
                 }
             }
         }
     } catch (err) {
-        console.error(`Error scanning directory ${dir}:`, err);
+        console.error(`Error scanning ${dir}:`, err);
     }
-
-    return fileList;
 }
 
 // Main Execution
-const photos: Photo[] = [];
+const batchBuffer: Photo[] = [];
 let targetPath = NAS_ROOT_PATH;
 
 if (isDefaultsMode) {
     targetPath = path.join(NAS_ROOT_PATH, DEFAULTS_FOLDER_NAME);
 }
 
-console.log(`Scanning: ${targetPath}...`);
-const foundPhotos = scanDirectory(targetPath, photos);
+console.log(`📷 Indexer started. Scanning: ${targetPath}`);
+scanDirectory(targetPath, batchBuffer);
 
-console.log(`✅ Found ${foundPhotos.length} photos.`);
-
-try {
-    fs.writeFileSync(PHOTOS_JSON_PATH, JSON.stringify(foundPhotos, null, 2));
-    console.log(`💾 Saved index to ${PHOTOS_JSON_PATH}`);
-} catch (err) {
-    console.error('Error writing JSON file:', err);
-    process.exit(1);
+// Send remaining photos in buffer
+if (batchBuffer.length > 0 && hasIPC) {
+    process.send!({ type: 'batch', photos: batchBuffer });
 }
+
+console.log(`✅ Indexer finished.`);
+process.exit(0);

@@ -205,12 +205,27 @@
                 photoEl.src = memory.imageSrc;
                 poemEl.innerText = `"${memory.text}"`;
                 
-                // Handle Author
+                // Handle Author & Error Styles
                 if (memory.type === 'quote' && memory.author) {
-                    authorEl.innerText = `- ${memory.author}`;
+                    authorEl.innerText = memory.author === 'System Alert' 
+                        ? memory.author 
+                        : `- ${memory.author}`;
+                    
                     authorEl.style.display = 'block';
+
+                    // Check for System Error
+                    if (memory.author === 'System Alert') {
+                        poemEl.style.color = '#ff6b6b'; // Red/Orange for error text
+                        authorEl.style.color = '#ff6b6b';
+                    } else {
+                        poemEl.style.color = '#f0f0f0'; // Default white
+                        authorEl.style.color = '#aaa';  // Default gray
+                    }
+
                 } else {
                     authorEl.style.display = 'none';
+                    // Reset to default if switching back from error state
+                    poemEl.style.color = '#f0f0f0';
                 }
 
                 // Handle Date
