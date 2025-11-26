@@ -16,6 +16,7 @@
             color: #fff;
             overflow: hidden;
             font-family: 'Merriweather', serif;
+            user-select: none;
         }
 
         #app {
@@ -56,12 +57,14 @@
             align-items: center;
             padding-bottom: 20px;
             z-index: 10;
+            pointer-events: none;
         }
 
         #content-wrapper {
             width: 80%; 
             text-align: center;
             margin-bottom: 30px; 
+            pointer-events: none;
         }
 
         #poem-text {
@@ -108,10 +111,105 @@
             transition: opacity 0.5s;
         }
 
-        /* Gesture Zones */
-        .gesture-zone { position: absolute; z-index: 999; }
-        #exit-zone { bottom: 0; right: 0; width: 100px; height: 100px; }
-        #reindex-zone { top: 0; left: 0; width: 100px; height: 100px; }
+        /* --- MENU STYLES --- */
+        #menu-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.85);
+            z-index: 2000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(5px);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        #menu-overlay.visible {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        #menu-box {
+            background: #1a1a1a;
+            padding: 30px;
+            border-radius: 15px;
+            border: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            min-width: 280px;
+            text-align: center;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+        }
+
+        .menu-title {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 1.2rem;
+            color: #fff;
+            margin-bottom: 5px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        /* Slider Styling */
+        .setting-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            background: #222;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        .setting-label {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 0.9rem;
+            color: #aaa;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        input[type=range] {
+            width: 100%;
+            cursor: pointer;
+            accent-color: #f0f0f0;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 15px 20px;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 1rem;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: transform 0.1s, background-color 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            font-weight: 600;
+        }
+
+        .btn:active { transform: scale(0.98); }
+        .btn-close { background: #333; color: #fff; margin-top: 5px; }
+        .btn-reload { background: #444; color: #fff; }
+        .btn-warn { background: #d35400; color: #fff; }
+        .btn-danger { background: #c0392b; color: #fff; }
+
+        #trigger-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 50; 
+        }
     </style>
 </head>
 <body>
@@ -131,104 +229,127 @@
             <div id="date-display"></div>
         </div>
 
-        <div id="exit-zone" class="gesture-zone"></div>
-        <div id="reindex-zone" class="gesture-zone"></div>
+        <!-- Invisible Trigger -->
+        <div id="trigger-layer"></div>
+
+        <!-- Menu -->
+        <div id="menu-overlay">
+            <div id="menu-box">
+                <div class="menu-title">Settings</div>
+                
+                <!-- Interval Slider -->
+                <div class="setting-group">
+                    <div class="setting-label">
+                        <span>Speed</span>
+                        <span id="interval-display">30s</span>
+                    </div>
+                    <input type="range" id="interval-slider" min="10" max="240" step="10" value="30">
+                </div>
+
+                <button class="btn btn-warn" onclick="menuActions.reindex()">
+                    <span>⚠️</span> Full Re-index
+                </button>
+                
+                <button class="btn btn-reload" onclick="menuActions.reload()">
+                    <span>↻</span> Reload App
+                </button>
+
+                <button class="btn btn-danger" onclick="menuActions.exit()">
+                    <span>⏻</span> Exit App
+                </button>
+
+                <button class="btn btn-close" onclick="menuActions.close()">
+                    Close
+                </button>
+            </div>
+        </div>
     </div>
 
     <script>
-        const REFRESH_INTERVAL = 60 * 1000; // 60 seconds
+        // --- CONFIGURATION & STATE ---
+        const DEFAULT_INTERVAL = 30000;
         
+        // Load saved preference or default
+        let currentInterval = parseInt(localStorage.getItem('photo_interval')) || DEFAULT_INTERVAL;
+        let nextMemoryPromise = null;
+        let displayTimer = null; // Handle for the timeout
+
         // DOM Elements
         const photoEl = document.getElementById('main-photo');
         const poemEl = document.getElementById('poem-text');
         const authorEl = document.getElementById('author-text');
         const dateEl = document.getElementById('date-display');
         const loaderEl = document.getElementById('loader');
+        const menuOverlay = document.getElementById('menu-overlay');
+        const triggerLayer = document.getElementById('trigger-layer');
+        
+        // Settings Elements
+        const sliderEl = document.getElementById('interval-slider');
+        const intervalDisplayEl = document.getElementById('interval-display');
 
-        // State for Preloading
-        let nextMemoryPromise = null;
+        // Initialize Slider
+        sliderEl.value = currentInterval / 1000;
+        intervalDisplayEl.innerText = `${sliderEl.value}s`;
 
-        /**
-         * 1. PRELOAD FUNCTION
-         * Fetches data AND fully loads the image in the background.
-         * Returns a Promise that resolves to the complete memory object.
-         */
+        // --- CORE LOGIC ---
+
         async function fetchNextMemory() {
             try {
-                // A. Fetch JSON Data
                 const response = await fetch('/api/next-memory');
                 if (!response.ok) throw new Error('Network error');
                 const data = await response.json();
 
-                // B. Preload Image Object (This is the key step!)
                 return new Promise((resolve, reject) => {
                     const img = new Image();
                     img.src = `/api/image?path=${data.imagePathEncoded}`;
-                    
-                    img.onload = () => {
-                        // Resolve with both data and the ready-to-use image source
-                        resolve({ ...data, imageSrc: img.src });
-                    };
+                    img.onload = () => resolve({ ...data, imageSrc: img.src });
                     img.onerror = () => reject("Image load failed");
                 });
-
             } catch (error) {
                 console.error("Preload failed, retrying in 5s...", error);
                 await new Promise(r => setTimeout(r, 5000));
-                return fetchNextMemory(); // Retry recursively
+                return fetchNextMemory(); 
             }
         }
 
-        /**
-         * 2. DISPLAY FUNCTION
-         * Swaps the current view with the preloaded one.
-         */
         async function updateDisplay() {
             try {
-                // If this is the very first load, we might need to start the fetch
-                if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
+                // Clear any pending timer to avoid overlaps
+                if (displayTimer) clearTimeout(displayTimer);
 
-                // Await the preloaded data (it might already be ready!)
+                if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                 const memory = await nextMemoryPromise;
 
-                // --- TRANSITION START ---
                 // Fade Out
                 photoEl.style.opacity = 0;
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
 
-                // Wait briefly for fade out to feel natural (optional)
                 await new Promise(r => setTimeout(r, 1000));
 
-                // Swap Content (Instant because imageSrc is preloaded)
+                // Swap Content
                 photoEl.src = memory.imageSrc;
                 poemEl.innerText = `"${memory.text}"`;
                 
-                // Handle Author & Error Styles
                 if (memory.type === 'quote' && memory.author) {
                     authorEl.innerText = memory.author === 'System Alert' 
                         ? memory.author 
                         : `- ${memory.author}`;
-                    
                     authorEl.style.display = 'block';
 
-                    // Check for System Error
                     if (memory.author === 'System Alert') {
-                        poemEl.style.color = '#ff6b6b'; // Red/Orange for error text
+                        poemEl.style.color = '#ff6b6b'; 
                         authorEl.style.color = '#ff6b6b';
                     } else {
-                        poemEl.style.color = '#f0f0f0'; // Default white
-                        authorEl.style.color = '#aaa';  // Default gray
+                        poemEl.style.color = '#f0f0f0'; 
+                        authorEl.style.color = '#aaa';  
                     }
-
                 } else {
                     authorEl.style.display = 'none';
-                    // Reset to default if switching back from error state
                     poemEl.style.color = '#f0f0f0';
                 }
 
-                // Handle Date
                 const dateObj = new Date(memory.date);
                 if (dateObj.getFullYear() > 1980) {
                     dateEl.innerText = dateObj.toLocaleDateString('pt-PT', { 
@@ -238,7 +359,6 @@
                     dateEl.innerText = ""; 
                 }
 
-                // Hide loader (only relevant for very first run)
                 loaderEl.style.opacity = 0;
 
                 // Fade In
@@ -247,55 +367,65 @@
                 if (memory.type === 'quote') authorEl.style.opacity = 1;
                 dateEl.style.opacity = 1;
 
-                // --- TRANSITION END ---
-
-                // 3. IMMEDIATELY START FETCHING THE NEXT ONE
-                // While the current one is being admired, we load the next one.
+                // Prepare next memory
                 nextMemoryPromise = fetchNextMemory();
+
+                // Schedule next update using the DYNAMIC interval
+                displayTimer = setTimeout(updateDisplay, currentInterval);
 
             } catch (error) {
                 console.error("Display update failed:", error);
+                // Retry sooner if error
+                displayTimer = setTimeout(updateDisplay, 5000);
             }
         }
 
-        // --- INITIALIZATION ---
-        
-        // 1. Start the first load immediately
+        // --- MENU & INTERACTIONS ---
+
+        triggerLayer.addEventListener('pointerdown', () => {
+            menuOverlay.classList.add('visible');
+        });
+
+        menuOverlay.addEventListener('click', (e) => {
+            if (e.target === menuOverlay) menuActions.close();
+        });
+
+        // Slider Logic
+        sliderEl.addEventListener('input', (e) => {
+            const seconds = e.target.value;
+            intervalDisplayEl.innerText = `${seconds}s`;
+            currentInterval = seconds * 1000;
+            localStorage.setItem('photo_interval', currentInterval);
+            // Note: We don't restart the timer immediately here to keep it smooth,
+            // but the NEXT cycle will pick up this new speed.
+        });
+
+        const menuActions = {
+            close: () => {
+                menuOverlay.classList.remove('visible');
+            },
+            reindex: async () => {
+                if (confirm("Re-index Library? This will clear the cache.")) {
+                    menuActions.close();
+                    loaderEl.style.opacity = 1;
+                    loaderEl.innerText = "Re-indexing Library...";
+                    try { await fetch('/api/reindex', { method: 'POST' }); } 
+                    catch (e) { alert("Error."); }
+                    setTimeout(() => loaderEl.innerText = "", 5000);
+                }
+            },
+            reload: () => window.location.reload(),
+            exit: async () => {
+                if (confirm("Exit Application?")) {
+                    await fetch('/api/exit', { method: 'POST' });
+                    document.body.innerHTML = "<h1 style='color:white;text-align:center;margin-top:20%'>Shutting Down...</h1>";
+                }
+            }
+        };
+
+        // Start Loop
         updateDisplay();
 
-        // 2. Set the interval to keep swapping
-        // Note: The 'nextMemoryPromise' ensures that if the interval fires
-        // but the network is slow, it simply waits until the data is ready.
-        setInterval(updateDisplay, REFRESH_INTERVAL);
-
-
-        // --- GESTURES (Unchanged) ---
-        const exitZone = document.getElementById('exit-zone');
-        let exitTimer = null;
-        exitZone.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            exitTimer = setTimeout(() => {
-                alert("Shutting down...");
-                fetch('/api/exit', { method: 'POST' });
-            }, 5000);
-        });
-        exitZone.addEventListener('touchend', () => clearTimeout(exitTimer));
-
-        const reindexZone = document.getElementById('reindex-zone');
-        let tapCount = 0;
-        let tapTimer = null;
-        reindexZone.addEventListener('click', () => {
-            tapCount++;
-            if (tapCount === 1) tapTimer = setTimeout(() => tapCount = 0, 800);
-            if (tapCount === 3) {
-                fetch('/api/reindex', { method: 'POST' });
-                loaderEl.style.opacity = 1;
-                loaderEl.innerText = "Re-indexing...";
-                setTimeout(() => loaderEl.innerText = "", 3000);
-                tapCount = 0;
-                clearTimeout(tapTimer);
-            }
-        });
     </script>
 </body>
 </html>

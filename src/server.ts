@@ -20,10 +20,18 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const model = genAI.getGenerativeModel({ model: modelName });
 
-const PHOTOS_JSON_PATH = process.env.PHOTOS_JSON_PATH || './photos.json';
-const TEXTS_JSON_PATH = './texts.json';
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH;
 const ERROR_IMAGE_MARKER = 'SYSTEM_ERROR_IMAGE';
+
+// --- CACHE SETUP ---
+const CACHE_DIR = './cache';
+const PHOTOS_JSON_PATH = path.join(CACHE_DIR, 'photos.json');
+const TEXTS_JSON_PATH = path.join(CACHE_DIR, 'texts.json');
+
+if (!fs.existsSync(CACHE_DIR)) {
+    console.log(`Creating cache directory at ${CACHE_DIR}`);
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 // --- DATA STRUCTURES ---
 interface Photo {
@@ -37,44 +45,39 @@ interface TextEntry {
     author: string | null;
 }
 
-// In-Memory Storage
-// We use a Set for fast "exists" checks to avoid duplicates during auto-reindex
 let photoPaths = new Set<string>(); 
 let photoLibrary: Photo[] = [];
 let textLibrary: Record<string, TextEntry> = {};
 
-// Flags
-let isDirtyPhotos = false; // Tracks if we need to save photos.json
+let isDirtyPhotos = false; 
+let isIndexing = false; 
 
 // --- PERSISTENCE HELPERS ---
 
 const loadLibraries = () => {
-    // 1. Load Photos
     try {
         if (fs.existsSync(PHOTOS_JSON_PATH)) {
             const data = fs.readFileSync(PHOTOS_JSON_PATH, 'utf-8');
             photoLibrary = JSON.parse(data);
-            // Rebuild the Set for fast lookups
             photoPaths = new Set(photoLibrary.map(p => p.path));
-            console.log(`📚 Photos loaded: ${photoLibrary.length}`);
+            console.log(`📚 Photos loaded from cache: ${photoLibrary.length}`);
         }
-    } catch (e) { console.error("Error loading photos:", e); }
+    } catch (e) { console.error("Error loading photos cache:", e); }
 
-    // 2. Load Texts (Poems/Quotes cache)
     try {
         if (fs.existsSync(TEXTS_JSON_PATH)) {
             const data = fs.readFileSync(TEXTS_JSON_PATH, 'utf-8');
             textLibrary = JSON.parse(data);
-            console.log(`📜 Texts loaded: ${Object.keys(textLibrary).length}`);
+            console.log(`📜 Texts loaded from cache: ${Object.keys(textLibrary).length}`);
         }
-    } catch (e) { console.error("Error loading texts:", e); }
+    } catch (e) { console.error("Error loading texts cache:", e); }
 };
 
 const savePhotosToDisk = () => {
     if (!isDirtyPhotos) return;
     try {
         fs.writeFileSync(PHOTOS_JSON_PATH, JSON.stringify(photoLibrary, null, 2));
-        console.log(`💾 Saved ${photoLibrary.length} photos to disk.`);
+        console.log(`💾 Persisted ${photoLibrary.length} photos to cache.`);
         isDirtyPhotos = false;
     } catch (e) { console.error("Error saving photos:", e); }
 };
@@ -87,22 +90,9 @@ const saveTextsToDisk = () => {
 
 // --- INDEXING LOGIC ---
 
-/**
- * Runs the indexer script as a child process.
- * It listens for 'batch' messages to update memory incrementally.
- */
 const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
     return new Promise((resolve, reject) => {
-        // Validation: Don't start indexing if NAS is missing
-        if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
-            console.error("CRITICAL: NAS Root path not found during index attempt:", NAS_ROOT_PATH);
-            return reject(new Error("NAS not mounted"));
-        }
-
         console.log(`Triggering Indexer [${mode}]...`);
-        
-        // We use 'fork' to enable IPC (Inter-Process Communication) easily.
-        // ts-node automatically handles .ts files when forking if started via ts-node.
         const indexer = fork('src/indexer.ts', [`--mode=${mode}`]);
 
         indexer.on('message', (msg: any) => {
@@ -115,58 +105,57 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
                         addedCount++;
                     }
                 });
-                
-                if (addedCount > 0) {
-                    isDirtyPhotos = true; // Mark for next save cycle
-                }
+                if (addedCount > 0) isDirtyPhotos = true; 
             }
         });
 
         indexer.on('close', (code) => {
             if (code === 0) {
                 console.log(`Indexer [${mode}] finished.`);
-                savePhotosToDisk(); // Force save at end of run
                 resolve();
             } else {
-                reject();
+                console.error(`Indexer [${mode}] failed/exited with code ${code}`);
+                reject(new Error(`Indexer failed with code ${code}`));
             }
         });
     });
 };
 
-/**
- * Orchestrates the reindexing process.
- * @param clearCache If true, wipes memory before starting (Manual/First Run). If false, appends (Auto-Nightly).
- */
 const performIndexing = async (clearCache: boolean) => {
+    if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
+        console.error("❌ CRITICAL: NAS Root path not found. Indexing aborted.");
+        isIndexing = false;
+        return; 
+    }
+
+    isIndexing = true;
+
     if (clearCache) {
-        console.log("🧹 Clearing Cache for Full Reindex...");
+        console.log("🧹 Clearing Memory for Full Reindex...");
         photoLibrary = [];
         photoPaths.clear();
-        isDirtyPhotos = true;
-        
-        // 1. Defaults First (Blocking-ish, we wait for it)
+        isDirtyPhotos = true; 
         try { await runIndexer('defaults'); } catch (e) { console.error("Defaults load failed"); }
     }
 
-    // 2. Full Scan (Background)
-    runIndexer('full').catch(err => console.error("Background index failed"));
+    runIndexer('full')
+        .then(() => {
+            console.log("✅ Full Indexing Complete.");
+            savePhotosToDisk(); 
+        })
+        .catch(err => console.error("❌ Background index failed:", err))
+        .finally(() => isIndexing = false);
 };
 
 // --- SCHEDULING ---
 
-// 1. Persistence Loop (Every 30 seconds)
-setInterval(() => {
-    savePhotosToDisk();
-}, 30 * 1000);
+setInterval(() => savePhotosToDisk(), 30 * 1000);
 
-// 2. Auto-Reindex Loop (Checks every minute)
 setInterval(() => {
     const now = new Date();
-    // Run at 02:00 AM
     if (now.getHours() === 2 && now.getMinutes() === 0) {
         console.log("🕑 2AM Auto-Index Triggered.");
-        performIndexing(false); // False = Do not clear cache, just append new files
+        performIndexing(false); 
     }
 }, 60 * 1000);
 
@@ -182,44 +171,59 @@ function fileToGenerativePart(filePath: string, mimeType: string) {
     };
 }
 
+// NEW HELPER: Retry Logic for AI
+async function generateWithRetry(prompt: string, imagePart: any, retries = 3, delay = 1000): Promise<string> {
+    try {
+        const result = await model.generateContent([prompt, imagePart]);
+        return result.response.text();
+    } catch (error: any) {
+        // Check for overload (503) or generic failures
+        if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded'))) {
+            console.warn(`⚠️ Gemini overloaded. Retrying in ${delay}ms... (${retries} attempts left)`);
+            await new Promise(r => setTimeout(r, delay));
+            return generateWithRetry(prompt, imagePart, retries - 1, delay * 2); // Exponential backoff
+        }
+        throw error;
+    }
+}
+
 app.get('/api/next-memory', async (req, res) => {
     try {
-        // CRITICAL CHECK: Ensure Volume is Mounted
         if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
-            console.error(`ERROR: Volume at ${NAS_ROOT_PATH} is not accessible.`);
             return res.json({
-                text: "⚠️ System Error: Photo storage volume is not mounted. Please check NAS connection.",
+                text: "⚠️ System Alert: Storage not accessible. Please check connection.",
                 type: 'quote',
                 author: "System Alert",
                 date: new Date().toISOString(),
-                imagePathEncoded: ERROR_IMAGE_MARKER // Special marker for the image endpoint
+                imagePathEncoded: ERROR_IMAGE_MARKER
             });
         }
 
         if (photoLibrary.length === 0) {
-            return res.status(503).json({ error: "Indexing photos..." });
+            if (isIndexing) return res.status(503).json({ error: "Indexing photos..." });
+            return res.json({
+                text: "⚠️ No photos found in library. Try re-indexing.",
+                type: 'quote',
+                author: "System Alert",
+                date: new Date().toISOString(),
+                imagePathEncoded: ERROR_IMAGE_MARKER
+            });
         }
 
-        // 1. Select Random Photo
         const randomIndex = Math.floor(Math.random() * photoLibrary.length);
         const selectedPhoto = photoLibrary[randomIndex];
 
         if (!fs.existsSync(selectedPhoto.path)) {
-            // Cleanup bad link
             photoLibrary.splice(randomIndex, 1);
             photoPaths.delete(selectedPhoto.path);
             return res.status(500).json({ error: "File missing" });
         }
 
-        // 2. CHECK CACHE (texts.json)
         let aiResponse: TextEntry;
 
         if (textLibrary[selectedPhoto.path]) {
-            // CACHE HIT: Use saved poem
             aiResponse = textLibrary[selectedPhoto.path];
         } else {
-            // CACHE MISS: Call Gemini
-            // console.log("✨ Generating new poem for:", path.basename(selectedPhoto.path));
             const prompt = `
                 You are a poetic assistant. Look at this image.
                 Task: Generate EITHER a short, beautiful poem (max 4 lines) OR select a profound famous quote that matches the mood.
@@ -230,19 +234,19 @@ app.get('/api/next-memory', async (req, res) => {
 
             try {
                 const imagePart = fileToGenerativePart(selectedPhoto.path, "image/jpeg");
-                const result = await model.generateContent([prompt, imagePart]);
-                const text = result.response.text();
-                const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
                 
+                // CHANGE: Use the new retry helper instead of calling model directly
+                const text = await generateWithRetry(prompt, imagePart);
+                
+                const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
                 aiResponse = JSON.parse(cleanText);
 
-                // SAVE TO CACHE
                 textLibrary[selectedPhoto.path] = aiResponse;
-                saveTextsToDisk(); // Save immediately to prevent API waste
+                saveTextsToDisk(); 
 
             } catch (aiError) {
-                console.error("Gemini Error:", aiError);
-                aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                console.error("Gemini Final Error:", aiError);
+                aiResponse = { content: "Memories are timeless treasures of the heart.", type: "poem", author: null };
             }
         }
 
@@ -262,18 +266,11 @@ app.get('/api/next-memory', async (req, res) => {
 
 app.get('/api/image', (req, res) => {
     const filePath = decodeURIComponent(req.query.path as string);
-    
-    // Fallback for System Errors
     if (filePath === ERROR_IMAGE_MARKER) {
-        // Return a 1x1 transparent pixel so the frontend image loads (and shows the text overlay)
         const img = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==", 'base64');
-        res.writeHead(200, {
-            'Content-Type': 'image/png',
-            'Content-Length': img.length
-        });
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': img.length });
         return res.end(img);
     }
-
     if (!filePath || !fs.existsSync(filePath)) return res.status(404).send('Image not found');
     res.sendFile(filePath);
 });
@@ -283,19 +280,14 @@ app.post('/api/exit', (req, res) => {
     exec('killall chromium-browser', () => setTimeout(() => process.exit(0), 1000));
 });
 
-// Manual Reindex (Triple Tap)
 app.post('/api/reindex', (req, res) => {
     res.json({ message: 'Reindexing started...' });
-    // Manual trigger = Clear cache and rebuild
     performIndexing(true);
 });
 
-// Start
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
     loadLibraries();
-
-    // First Run Logic
     if (photoLibrary.length === 0) {
         console.log("⚠️ Library empty. Starting First-Run Indexing.");
         performIndexing(true);
