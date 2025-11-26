@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poetic Memories</title>
+    <link href="https://fonts.googleapis.com/css2?family=Merriweather:ital,wght@0,300;0,400;1,300&family=Montserrat:wght@400;600&display=swap" rel="stylesheet">
+    
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #000;
+            color: #fff;
+            overflow: hidden;
+            font-family: 'Merriweather', serif;
+        }
+
+        #app {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        /* PHOTO LAYER */
+        #photo-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000;
+        }
+
+        #main-photo {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain; 
+            opacity: 0;
+            transition: opacity 1.5s ease-in-out;
+        }
+
+        /* TEXT LAYER (Overlay) */
+        #text-overlay {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            min-height: 25vh; 
+            background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.6) 60%, rgba(0,0,0,0) 100%);
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end; 
+            align-items: center;
+            padding-bottom: 20px;
+            z-index: 10;
+        }
+
+        #content-wrapper {
+            width: 80%; 
+            text-align: center;
+            margin-bottom: 30px; 
+        }
+
+        #poem-text {
+            font-size: 1.8rem;
+            font-style: italic;
+            line-height: 1.4;
+            color: #f0f0f0;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+            opacity: 0;
+            transition: opacity 2s ease-in-out 0.5s;
+        }
+
+        #author-text {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 0.9rem;
+            color: #aaa;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-top: 15px;
+            opacity: 0;
+            transition: opacity 2s ease-in-out 0.8s;
+        }
+
+        /* DATE DISPLAY */
+        #date-display {
+            position: absolute;
+            bottom: 25px;
+            right: 30px;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 0.85rem;
+            color: #888;
+            letter-spacing: 1px;
+            opacity: 0;
+            transition: opacity 2s ease-in-out 1s;
+        }
+
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #333;
+            font-family: sans-serif;
+            transition: opacity 0.5s;
+        }
+
+        /* Gesture Zones */
+        .gesture-zone { position: absolute; z-index: 999; }
+        #exit-zone { bottom: 0; right: 0; width: 100px; height: 100px; }
+        #reindex-zone { top: 0; left: 0; width: 100px; height: 100px; }
+    </style>
+</head>
+<body>
+
+    <div id="app">
+        <div id="loader">Curating memories...</div>
+        
+        <div id="photo-container">
+            <img id="main-photo" src="" alt="Memory">
+        </div>
+
+        <div id="text-overlay">
+            <div id="content-wrapper">
+                <div id="poem-text"></div>
+                <div id="author-text"></div>
+            </div>
+            <div id="date-display"></div>
+        </div>
+
+        <div id="exit-zone" class="gesture-zone"></div>
+        <div id="reindex-zone" class="gesture-zone"></div>
+    </div>
+
+    <script>
+        const REFRESH_INTERVAL = 60 * 1000; // 60 seconds
+        
+        // DOM Elements
+        const photoEl = document.getElementById('main-photo');
+        const poemEl = document.getElementById('poem-text');
+        const authorEl = document.getElementById('author-text');
+        const dateEl = document.getElementById('date-display');
+        const loaderEl = document.getElementById('loader');
+
+        // State for Preloading
+        let nextMemoryPromise = null;
+
+        /**
+         * 1. PRELOAD FUNCTION
+         * Fetches data AND fully loads the image in the background.
+         * Returns a Promise that resolves to the complete memory object.
+         */
+        async function fetchNextMemory() {
+            try {
+                // A. Fetch JSON Data
+                const response = await fetch('/api/next-memory');
+                if (!response.ok) throw new Error('Network error');
+                const data = await response.json();
+
+                // B. Preload Image Object (This is the key step!)
+                return new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.src = `/api/image?path=${data.imagePathEncoded}`;
+                    
+                    img.onload = () => {
+                        // Resolve with both data and the ready-to-use image source
+                        resolve({ ...data, imageSrc: img.src });
+                    };
+                    img.onerror = () => reject("Image load failed");
+                });
+
+            } catch (error) {
+                console.error("Preload failed, retrying in 5s...", error);
+                await new Promise(r => setTimeout(r, 5000));
+                return fetchNextMemory(); // Retry recursively
+            }
+        }
+
+        /**
+         * 2. DISPLAY FUNCTION
+         * Swaps the current view with the preloaded one.
+         */
+        async function updateDisplay() {
+            try {
+                // If this is the very first load, we might need to start the fetch
+                if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
+
+                // Await the preloaded data (it might already be ready!)
+                const memory = await nextMemoryPromise;
+
+                // --- TRANSITION START ---
+                // Fade Out
+                photoEl.style.opacity = 0;
+                poemEl.style.opacity = 0;
+                authorEl.style.opacity = 0;
+                dateEl.style.opacity = 0;
+
+                // Wait briefly for fade out to feel natural (optional)
+                await new Promise(r => setTimeout(r, 1000));
+
+                // Swap Content (Instant because imageSrc is preloaded)
+                photoEl.src = memory.imageSrc;
+                poemEl.innerText = `"${memory.text}"`;
+                
+                // Handle Author
+                if (memory.type === 'quote' && memory.author) {
+                    authorEl.innerText = `- ${memory.author}`;
+                    authorEl.style.display = 'block';
+                } else {
+                    authorEl.style.display = 'none';
+                }
+
+                // Handle Date
+                const dateObj = new Date(memory.date);
+                if (dateObj.getFullYear() > 1980) {
+                    dateEl.innerText = dateObj.toLocaleDateString('pt-PT', { 
+                        year: 'numeric', month: 'long', day: 'numeric' 
+                    }).toUpperCase();
+                } else {
+                    dateEl.innerText = ""; 
+                }
+
+                // Hide loader (only relevant for very first run)
+                loaderEl.style.opacity = 0;
+
+                // Fade In
+                photoEl.style.opacity = 1;
+                poemEl.style.opacity = 1;
+                if (memory.type === 'quote') authorEl.style.opacity = 1;
+                dateEl.style.opacity = 1;
+
+                // --- TRANSITION END ---
+
+                // 3. IMMEDIATELY START FETCHING THE NEXT ONE
+                // While the current one is being admired, we load the next one.
+                nextMemoryPromise = fetchNextMemory();
+
+            } catch (error) {
+                console.error("Display update failed:", error);
+            }
+        }
+
+        // --- INITIALIZATION ---
+        
+        // 1. Start the first load immediately
+        updateDisplay();
+
+        // 2. Set the interval to keep swapping
+        // Note: The 'nextMemoryPromise' ensures that if the interval fires
+        // but the network is slow, it simply waits until the data is ready.
+        setInterval(updateDisplay, REFRESH_INTERVAL);
+
+
+        // --- GESTURES (Unchanged) ---
+        const exitZone = document.getElementById('exit-zone');
+        let exitTimer = null;
+        exitZone.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            exitTimer = setTimeout(() => {
+                alert("Shutting down...");
+                fetch('/api/exit', { method: 'POST' });
+            }, 5000);
+        });
+        exitZone.addEventListener('touchend', () => clearTimeout(exitTimer));
+
+        const reindexZone = document.getElementById('reindex-zone');
+        let tapCount = 0;
+        let tapTimer = null;
+        reindexZone.addEventListener('click', () => {
+            tapCount++;
+            if (tapCount === 1) tapTimer = setTimeout(() => tapCount = 0, 800);
+            if (tapCount === 3) {
+                fetch('/api/reindex', { method: 'POST' });
+                loaderEl.style.opacity = 1;
+                loaderEl.innerText = "Re-indexing...";
+                setTimeout(() => loaderEl.innerText = "", 3000);
+                tapCount = 0;
+                clearTimeout(tapTimer);
+            }
+        });
+    </script>
+</body>
+</html>
