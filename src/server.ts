@@ -29,6 +29,7 @@ const CACHE_DIR = './cache';
 const PHOTOS_JSON_PATH = path.join(CACHE_DIR, 'photos.json');
 const TEXTS_JSON_PATH = path.join(CACHE_DIR, 'texts.json');
 
+// Ensure cache directory exists immediately
 if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
@@ -92,6 +93,7 @@ const saveTextsToDisk = () => {
 
 const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
     return new Promise((resolve, reject) => {
+        // We use 'fork' to run the indexer in a separate process
         const indexer = fork('src/indexer.ts', [`--mode=${mode}`]);
 
         indexer.on('message', (msg: any) => {
@@ -116,6 +118,7 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
 };
 
 const performIndexing = async (clearCache: boolean) => {
+    // Safety check: Don't wipe cache if NAS is missing
     if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
         isIndexing = false;
         return; 
@@ -142,6 +145,7 @@ const performIndexing = async (clearCache: boolean) => {
 setInterval(() => savePhotosToDisk(), 30 * 1000);
 setInterval(() => {
     const now = new Date();
+    // Run at 02:00 AM
     if (now.getHours() === 2 && now.getMinutes() === 0) performIndexing(false); 
 }, 60 * 1000);
 
@@ -161,6 +165,7 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
         const result = await model.generateContent([prompt, imagePart]);
         return result.response.text();
     } catch (error: any) {
+        // Retry on overload (503)
         if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded'))) {
             await new Promise(r => setTimeout(r, delay));
             return generateWithRetry(prompt, imagePart, retries - 1, delay * 2);
@@ -171,6 +176,7 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
 
 app.get('/api/next-memory', async (req, res) => {
     try {
+        // 1. Check NAS Availability
         if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
             return res.json({
                 text: "⚠️ System Alert: Storage not accessible.",
@@ -181,35 +187,40 @@ app.get('/api/next-memory', async (req, res) => {
             });
         }
 
+        // 2. Check Library Status
         if (photoLibrary.length === 0) {
             return res.status(503).json({ error: "Library empty or indexing..." });
         }
 
+        // 3. Select Photo
         const randomIndex = Math.floor(Math.random() * photoLibrary.length);
         const selectedPhoto = photoLibrary[randomIndex];
 
         if (!fs.existsSync(selectedPhoto.path)) {
+            // Self-healing: remove missing file
             photoLibrary.splice(randomIndex, 1);
             photoPaths.delete(selectedPhoto.path);
             return res.status(500).json({ error: "File missing" });
         }
 
+        // 4. Get Text (Cache or AI)
         let aiResponse: TextEntry;
 
         if (textLibrary[selectedPhoto.path]) {
             aiResponse = textLibrary[selectedPhoto.path];
         } else {
-            // HYBRID LOGIC: Give a strong hint (preference), but allow Gemini to override.
+            // HYBRID PROMPT LOGIC
             const roll = Math.random();
-            const preferredType = roll < 0.3 ? "poem" : "quote"; // 30% Poem, 70% Quote preference
+            // 70% preference for Quotes, 30% for Poems
+            const preferredType = roll < 0.3 ? "poem" : "quote";
             
             const prompt = `
                 You are a poetic assistant for a digital photo frame. Look at this image.
                 
                 Goal: Generate text that matches the mood, location, or emotion of the photo.
                 
-                Preference for this specific image: I am leaning towards a **${preferredType.toUpperCase()}**. 
-                Please try to provide a ${preferredType}, unless the image content clearly suits the other format much better.
+                Preference: I am leaning towards a **${preferredType.toUpperCase()}** for this specific image. 
+                However, please override this preference if the image content clearly suits the other format much better.
                 
                 Definitions:
                 - Quote: A profound, existing famous quote.
@@ -224,8 +235,12 @@ app.get('/api/next-memory', async (req, res) => {
             try {
                 const imagePart = fileToGenerativePart(selectedPhoto.path, "image/jpeg");
                 const text = await generateWithRetry(prompt, imagePart);
+                
+                // Clean up markdown code blocks if present
                 const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
                 aiResponse = JSON.parse(cleanText);
+                
+                // Save to cache
                 textLibrary[selectedPhoto.path] = aiResponse;
                 saveTextsToDisk(); 
             } catch (aiError) {
@@ -251,6 +266,7 @@ app.get('/api/next-memory', async (req, res) => {
 app.get('/api/image', (req, res) => {
     const filePath = decodeURIComponent(req.query.path as string);
     if (filePath === ERROR_IMAGE_MARKER) {
+        // Return 1x1 transparent pixel
         const img = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==", 'base64');
         res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': img.length });
         return res.end(img);
@@ -259,7 +275,7 @@ app.get('/api/image', (req, res) => {
     res.sendFile(filePath);
 });
 
-// --- NEW ENDPOINTS ---
+// --- MANAGEMENT ENDPOINTS ---
 
 app.post('/api/favorite', (req, res) => {
     try {
@@ -275,6 +291,7 @@ app.post('/api/favorite', (req, res) => {
 
         if (currentPath === newPath) return res.json({message: "Already in favorites"});
         
+        // Handle name collisions
         if (fs.existsSync(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
@@ -282,14 +299,17 @@ app.post('/api/favorite', (req, res) => {
              newPath = path.join(defaultsDir, `${name}_${timestamp}${ext}`);
         }
 
+        // Move file
         fs.renameSync(currentPath, newPath);
 
+        // Update In-Memory Data
         const photoEntry = photoLibrary.find(p => p.path === currentPath);
         if (photoEntry) photoEntry.path = newPath;
         
         photoPaths.delete(currentPath);
         photoPaths.add(newPath);
 
+        // Update Text Cache Key
         if (textLibrary[currentPath]) {
             textLibrary[newPath] = textLibrary[currentPath];
             delete textLibrary[currentPath];
@@ -311,8 +331,10 @@ app.delete('/api/photo', (req, res) => {
         const { currentPath } = req.body;
         if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
 
+        // Delete from disk
         fs.unlinkSync(currentPath);
 
+        // Remove from memory
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
         
@@ -333,7 +355,11 @@ app.delete('/api/photo', (req, res) => {
 
 app.post('/api/exit', (req, res) => {
     res.json({ message: 'Shutting down...' });
-    exec('killall chromium-browser', () => setTimeout(() => process.exit(0), 1000));
+    // Try killing both common browser process names
+    exec('killall chromium-browser', () => {}); 
+    exec('killall chromium', () => {});
+    // Kill server
+    setTimeout(() => process.exit(0), 1000);
 });
 
 app.post('/api/reindex', (req, res) => {

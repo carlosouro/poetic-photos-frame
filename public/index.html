@@ -11,6 +11,9 @@
             margin: 0; padding: 0; width: 100%; height: 100%;
             background-color: #000; color: #fff; overflow: hidden;
             font-family: 'Merriweather', serif; user-select: none;
+            
+            /* HIDE CURSOR BY DEFAULT */
+            cursor: none; 
         }
 
         #app { position: relative; width: 100vw; height: 100vh; }
@@ -59,6 +62,9 @@
             display: flex; justify-content: center; align-items: center;
             backdrop-filter: blur(5px); opacity: 0; pointer-events: none;
             transition: opacity 0.3s ease;
+            
+            /* SHOW CURSOR WHEN MENUS ARE OPEN */
+            cursor: default;
         }
         .overlay-visible { opacity: 1 !important; pointer-events: auto !important; }
 
@@ -111,9 +117,10 @@
             <div id="date-display"></div>
         </div>
 
+        <!-- Invisible Layer to catch taps -->
         <div id="trigger-layer"></div>
 
-        <!-- MENU -->
+        <!-- MAIN MENU -->
         <div id="menu-overlay">
             <div id="menu-box">
                 <div class="menu-title">Control Panel</div>
@@ -140,7 +147,7 @@
             </div>
         </div>
 
-        <!-- DELETE CONFIRMATION -->
+        <!-- DELETE CONFIRMATION MODAL -->
         <div id="delete-confirm-overlay">
             <div id="menu-box">
                 <div class="menu-title" style="color:#c0392b">Delete Photo?</div>
@@ -154,12 +161,14 @@
     </div>
 
     <script>
+        // --- CONFIG & STATE ---
         const DEFAULT_INTERVAL = 30000;
         let currentInterval = parseInt(localStorage.getItem('photo_interval')) || DEFAULT_INTERVAL;
         let nextMemoryPromise = null;
         let displayTimer = null;
-        let currentMemory = null; // Track current photo data for actions
+        let currentMemory = null; // Stores current photo data for actions
 
+        // Elements
         const photoEl = document.getElementById('main-photo');
         const poemEl = document.getElementById('poem-text');
         const authorEl = document.getElementById('author-text');
@@ -171,8 +180,11 @@
         const sliderEl = document.getElementById('interval-slider');
         const intervalDisplayEl = document.getElementById('interval-display');
 
+        // Init Slider
         sliderEl.value = currentInterval / 1000;
         intervalDisplayEl.innerText = `${sliderEl.value}s`;
+
+        // --- CORE LOGIC ---
 
         async function fetchNextMemory() {
             try {
@@ -198,17 +210,20 @@
                 if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                 
                 const memory = await nextMemoryPromise;
-                currentMemory = memory; // Store for menu actions
+                currentMemory = memory; 
 
+                // Fade Out
                 photoEl.style.opacity = 0;
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
                 await new Promise(r => setTimeout(r, 1000));
 
+                // Swap
                 photoEl.src = memory.imageSrc;
                 poemEl.innerText = `"${memory.text}"`;
                 
+                // Handle Author & Error Colors
                 if (memory.type === 'quote' && memory.author) {
                     authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
                     authorEl.style.display = 'block';
@@ -230,11 +245,14 @@
                 }
 
                 loaderEl.style.opacity = 0;
+                
+                // Fade In
                 photoEl.style.opacity = 1;
                 poemEl.style.opacity = 1;
                 if (memory.type === 'quote') authorEl.style.opacity = 1;
                 dateEl.style.opacity = 1;
 
+                // Queue next
                 nextMemoryPromise = fetchNextMemory();
                 displayTimer = setTimeout(updateDisplay, currentInterval);
             } catch (error) {
@@ -243,8 +261,15 @@
             }
         }
 
-        document.getElementById('trigger-layer').addEventListener('pointerdown', () => menuOverlay.classList.add('overlay-visible'));
-        menuOverlay.addEventListener('click', (e) => { if (e.target === menuOverlay) menuActions.close(); });
+        // --- INTERACTION HANDLERS ---
+
+        document.getElementById('trigger-layer').addEventListener('pointerdown', () => {
+            menuOverlay.classList.add('overlay-visible');
+        });
+
+        menuOverlay.addEventListener('click', (e) => { 
+            if (e.target === menuOverlay) menuActions.close(); 
+        });
         
         sliderEl.addEventListener('input', (e) => {
             const seconds = e.target.value;
@@ -259,7 +284,6 @@
             favorite: async () => {
                 if (!currentMemory) return;
                 try {
-                    // Send decoded path to server
                     const currentPath = decodeURIComponent(currentMemory.imagePathEncoded);
                     const res = await fetch('/api/favorite', {
                         method: 'POST',
@@ -297,15 +321,15 @@
                     
                     if (res.ok) {
                         menuActions.cancelDelete();
-                        // Force immediate update to next photo
                         loaderEl.style.opacity = 1; 
                         loaderEl.innerText = "Deleting...";
-                        nextMemoryPromise = null; // Force fetch new one
+                        nextMemoryPromise = null; 
                         updateDisplay();
                     } else {
-                        alert("Failed to delete.");
+                        const errData = await res.json();
+                        alert("Failed to delete: " + (errData.error || "Unknown error"));
                     }
-                } catch(e) { alert("Error deleting file."); }
+                } catch(e) { alert("Error deleting file: " + e.message); }
             },
 
             reindex: async () => {
@@ -325,6 +349,7 @@
             }
         };
 
+        // Start App
         updateDisplay();
     </script>
 </body>
