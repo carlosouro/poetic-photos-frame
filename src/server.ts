@@ -17,8 +17,18 @@ app.use(express.static('public'));
 
 // --- CONFIGURATION ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+
+// Default to the new Gemini 3 model, but allow .env override
 const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const model = genAI.getGenerativeModel({ model: modelName });
+
+// FIXED: Force 'v1beta' API version to access the latest Preview models like Gemini 3
+// Cast to 'any' to bypass TypeScript definition issues if older SDK
+const model = genAI.getGenerativeModel({ 
+    model: modelName
+},
+{ 
+    apiVersion: 'v1beta' 
+});
 
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH;
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
@@ -89,11 +99,46 @@ const saveTextsToDisk = () => {
     } catch (e) { console.error("Error saving texts:", e); }
 };
 
+// --- SMART PHOTO SELECTION ---
+
+function selectSmartPhoto(): Photo | null {
+    if (photoLibrary.length === 0) return null;
+
+    const now = new Date();
+    const msPerDay = 1000 * 60 * 60 * 24;
+
+    // Filter for "Recent" (Last 10 days) and "On This Day" (+/- 10 days in past years)
+    const smartCandidates = photoLibrary.filter(photo => {
+        const pDate = new Date(photo.created);
+        if (isNaN(pDate.getTime())) return false;
+
+        // A. Recent check (last 10 days)
+        const diffTime = now.getTime() - pDate.getTime();
+        const diffDays = diffTime / msPerDay;
+        if (diffDays >= 0 && diffDays <= 10) return true;
+
+        // B. "On This Day" check (ignoring year)
+        const pDateCurrentYear = new Date(pDate);
+        pDateCurrentYear.setFullYear(now.getFullYear());
+        
+        const timeDiff = Math.abs(now.getTime() - pDateCurrentYear.getTime());
+        const dayDiff = Math.ceil(timeDiff / msPerDay);
+
+        return dayDiff <= 10;
+    });
+
+    // Strategy: Use smart candidates 70% of the time, Random 30%
+    if (smartCandidates.length > 0 && Math.random() < 0.7) {
+        return smartCandidates[Math.floor(Math.random() * smartCandidates.length)];
+    } else {
+        return photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+    }
+}
+
 // --- INDEXING LOGIC ---
 
 const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
     return new Promise((resolve, reject) => {
-        // We use 'fork' to run the indexer in a separate process
         const indexer = fork('src/indexer.ts', [`--mode=${mode}`]);
 
         indexer.on('message', (msg: any) => {
@@ -118,7 +163,6 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
 };
 
 const performIndexing = async (clearCache: boolean) => {
-    // Safety check: Don't wipe cache if NAS is missing
     if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
         isIndexing = false;
         return; 
@@ -145,7 +189,6 @@ const performIndexing = async (clearCache: boolean) => {
 setInterval(() => savePhotosToDisk(), 30 * 1000);
 setInterval(() => {
     const now = new Date();
-    // Run at 02:00 AM
     if (now.getHours() === 2 && now.getMinutes() === 0) performIndexing(false); 
 }, 60 * 1000);
 
@@ -165,7 +208,6 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
         const result = await model.generateContent([prompt, imagePart]);
         return result.response.text();
     } catch (error: any) {
-        // Retry on overload (503)
         if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded'))) {
             await new Promise(r => setTimeout(r, delay));
             return generateWithRetry(prompt, imagePart, retries - 1, delay * 2);
@@ -176,7 +218,6 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
 
 app.get('/api/next-memory', async (req, res) => {
     try {
-        // 1. Check NAS Availability
         if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
             return res.json({
                 text: "⚠️ System Alert: Storage not accessible.",
@@ -187,32 +228,30 @@ app.get('/api/next-memory', async (req, res) => {
             });
         }
 
-        // 2. Check Library Status
         if (photoLibrary.length === 0) {
             return res.status(503).json({ error: "Library empty or indexing..." });
         }
 
-        // 3. Select Photo
-        const randomIndex = Math.floor(Math.random() * photoLibrary.length);
-        const selectedPhoto = photoLibrary[randomIndex];
+        // 1. SELECT PHOTO
+        let selectedPhoto = selectSmartPhoto();
+        if (!selectedPhoto) {
+             selectedPhoto = photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+        }
 
         if (!fs.existsSync(selectedPhoto.path)) {
-            // Self-healing: remove missing file
-            photoLibrary.splice(randomIndex, 1);
+            photoLibrary = photoLibrary.filter(p => p.path !== selectedPhoto!.path);
             photoPaths.delete(selectedPhoto.path);
             return res.status(500).json({ error: "File missing" });
         }
 
-        // 4. Get Text (Cache or AI)
         let aiResponse: TextEntry;
 
         if (textLibrary[selectedPhoto.path]) {
             aiResponse = textLibrary[selectedPhoto.path];
         } else {
-            // HYBRID PROMPT LOGIC
+            // 2. HYBRID LOGIC
             const roll = Math.random();
-            // 70% preference for Quotes, 30% for Poems
-            const preferredType = roll < 0.3 ? "poem" : "quote";
+            const preferredType = roll < 0.3 ? "poem" : "quote"; // 70% Quote bias
             
             const prompt = `
                 You are a poetic assistant for a digital photo frame. Look at this image.
@@ -266,7 +305,6 @@ app.get('/api/next-memory', async (req, res) => {
 app.get('/api/image', (req, res) => {
     const filePath = decodeURIComponent(req.query.path as string);
     if (filePath === ERROR_IMAGE_MARKER) {
-        // Return 1x1 transparent pixel
         const img = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==", 'base64');
         res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': img.length });
         return res.end(img);
@@ -291,7 +329,6 @@ app.post('/api/favorite', (req, res) => {
 
         if (currentPath === newPath) return res.json({message: "Already in favorites"});
         
-        // Handle name collisions
         if (fs.existsSync(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
@@ -299,17 +336,14 @@ app.post('/api/favorite', (req, res) => {
              newPath = path.join(defaultsDir, `${name}_${timestamp}${ext}`);
         }
 
-        // Move file
         fs.renameSync(currentPath, newPath);
 
-        // Update In-Memory Data
         const photoEntry = photoLibrary.find(p => p.path === currentPath);
         if (photoEntry) photoEntry.path = newPath;
         
         photoPaths.delete(currentPath);
         photoPaths.add(newPath);
 
-        // Update Text Cache Key
         if (textLibrary[currentPath]) {
             textLibrary[newPath] = textLibrary[currentPath];
             delete textLibrary[currentPath];
@@ -331,10 +365,8 @@ app.delete('/api/photo', (req, res) => {
         const { currentPath } = req.body;
         if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
 
-        // Delete from disk
         fs.unlinkSync(currentPath);
 
-        // Remove from memory
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
         
@@ -355,10 +387,8 @@ app.delete('/api/photo', (req, res) => {
 
 app.post('/api/exit', (req, res) => {
     res.json({ message: 'Shutting down...' });
-    // Try killing both common browser process names
     exec('killall chromium-browser', () => {}); 
     exec('killall chromium', () => {});
-    // Kill server
     setTimeout(() => process.exit(0), 1000);
 });
 

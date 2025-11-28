@@ -11,9 +11,7 @@
             margin: 0; padding: 0; width: 100%; height: 100%;
             background-color: #000; color: #fff; overflow: hidden;
             font-family: 'Merriweather', serif; user-select: none;
-            
-            /* HIDE CURSOR BY DEFAULT */
-            cursor: none; 
+            /* JS handles cursor visibility now */
         }
 
         #app { position: relative; width: 100vw; height: 100vh; }
@@ -55,6 +53,12 @@
             color: #333; font-family: sans-serif; transition: opacity 0.5s;
         }
 
+        /* CLICK ZONES */
+        .click-zone { position: absolute; top: 0; height: 100%; z-index: 50; }
+        #zone-left { left: 0; width: 30%; cursor: w-resize; }
+        #zone-center { left: 30%; width: 40%; cursor: pointer; }
+        #zone-right { left: 70%; width: 30%; cursor: e-resize; }
+
         /* MENU STYLES */
         #menu-overlay, #delete-confirm-overlay {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
@@ -62,8 +66,6 @@
             display: flex; justify-content: center; align-items: center;
             backdrop-filter: blur(5px); opacity: 0; pointer-events: none;
             transition: opacity 0.3s ease;
-            
-            /* SHOW CURSOR WHEN MENUS ARE OPEN */
             cursor: default;
         }
         .overlay-visible { opacity: 1 !important; pointer-events: auto !important; }
@@ -93,9 +95,6 @@
         .setting-label { font-family: 'Montserrat', sans-serif; font-size: 0.9rem; color: #aaa; display: flex; justify-content: space-between; }
         input[type=range] { width: 100%; accent-color: #f0f0f0; cursor: pointer; }
 
-        #trigger-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 50; }
-
-        /* Delete Modal Specifics */
         #delete-preview-img { max-width: 200px; max-height: 200px; border-radius: 8px; margin: 10px auto; border: 2px solid #c0392b; }
         .delete-msg { color: #aaa; font-size: 0.9rem; margin-bottom: 10px; }
     </style>
@@ -117,10 +116,12 @@
             <div id="date-display"></div>
         </div>
 
-        <!-- Invisible Layer to catch taps -->
-        <div id="trigger-layer"></div>
+        <!-- 3 CLICK ZONES -->
+        <div id="zone-left" class="click-zone"></div>
+        <div id="zone-center" class="click-zone"></div>
+        <div id="zone-right" class="click-zone"></div>
 
-        <!-- MAIN MENU -->
+        <!-- MENU -->
         <div id="menu-overlay">
             <div id="menu-box">
                 <div class="menu-title">Control Panel</div>
@@ -147,7 +148,7 @@
             </div>
         </div>
 
-        <!-- DELETE CONFIRMATION MODAL -->
+        <!-- DELETE CONFIRM -->
         <div id="delete-confirm-overlay">
             <div id="menu-box">
                 <div class="menu-title" style="color:#c0392b">Delete Photo?</div>
@@ -166,7 +167,10 @@
         let currentInterval = parseInt(localStorage.getItem('photo_interval')) || DEFAULT_INTERVAL;
         let nextMemoryPromise = null;
         let displayTimer = null;
-        let currentMemory = null; // Stores current photo data for actions
+        
+        let currentMemory = null; 
+        let historyStack = []; 
+        const HISTORY_LIMIT = 25;
 
         // Elements
         const photoEl = document.getElementById('main-photo');
@@ -184,6 +188,20 @@
         sliderEl.value = currentInterval / 1000;
         intervalDisplayEl.innerText = `${sliderEl.value}s`;
 
+        // --- MOUSE AUTOHIDE LOGIC ---
+        let mouseTimer = null;
+        document.addEventListener('mousemove', () => {
+            document.body.style.cursor = 'default';
+            if (mouseTimer) clearTimeout(mouseTimer);
+            mouseTimer = setTimeout(() => {
+                // Only hide if menu is NOT open
+                if (!menuOverlay.classList.contains('overlay-visible') && 
+                    !deleteOverlay.classList.contains('overlay-visible')) {
+                    document.body.style.cursor = 'none';
+                }
+            }, 2000);
+        });
+
         // --- CORE LOGIC ---
 
         async function fetchNextMemory() {
@@ -198,74 +216,110 @@
                     img.onerror = () => reject("Image load failed");
                 });
             } catch (error) {
-                console.error("Preload failed, retrying in 5s...", error);
+                console.error("Fetch failed, retrying...", error);
                 await new Promise(r => setTimeout(r, 5000));
                 return fetchNextMemory(); 
             }
         }
 
-        async function updateDisplay() {
+        function renderMemory(memory) {
+            photoEl.src = memory.imageSrc;
+            poemEl.innerText = `"${memory.text}"`;
+            
+            if (memory.type === 'quote' && memory.author) {
+                authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
+                authorEl.style.display = 'block';
+                if (memory.author === 'System Alert') {
+                    poemEl.style.color = '#ff6b6b'; authorEl.style.color = '#ff6b6b';
+                } else {
+                    poemEl.style.color = '#f0f0f0'; authorEl.style.color = '#aaa';  
+                }
+            } else {
+                authorEl.style.display = 'none';
+                poemEl.style.color = '#f0f0f0';
+            }
+
+            const dateObj = new Date(memory.date);
+            if (dateObj.getFullYear() > 1980) {
+                dateEl.innerText = dateObj.toLocaleDateString('pt-PT', { year: 'numeric', month: 'long', day: 'numeric' }).toUpperCase();
+            } else {
+                dateEl.innerText = ""; 
+            }
+        }
+
+        async function updateDisplay(useHistory = false) {
             try {
                 if (displayTimer) clearTimeout(displayTimer);
-                if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
-                
-                const memory = await nextMemoryPromise;
-                currentMemory = memory; 
 
-                // Fade Out
+                // Show loader only if we are manually navigating
+                if (!nextMemoryPromise && !useHistory) loaderEl.style.opacity = 1;
+
+                // --- 1. GET DATA ---
+                let memory;
+                if (useHistory && historyStack.length > 0) {
+                    memory = historyStack.pop();
+                    // Invalidate forward promise to sync
+                    nextMemoryPromise = null; 
+                } else {
+                    if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
+                    
+                    // Add current to history before switching
+                    if (currentMemory) {
+                        historyStack.push(currentMemory);
+                        if (historyStack.length > HISTORY_LIMIT) historyStack.shift();
+                    }
+                    
+                    memory = await nextMemoryPromise;
+                }
+
+                currentMemory = memory;
+
+                // --- 2. ANIMATE ---
                 photoEl.style.opacity = 0;
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
-                await new Promise(r => setTimeout(r, 1000));
-
-                // Swap
-                photoEl.src = memory.imageSrc;
-                poemEl.innerText = `"${memory.text}"`;
                 
-                // Handle Author & Error Colors
-                if (memory.type === 'quote' && memory.author) {
-                    authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
-                    authorEl.style.display = 'block';
-                    if (memory.author === 'System Alert') {
-                        poemEl.style.color = '#ff6b6b'; authorEl.style.color = '#ff6b6b';
-                    } else {
-                        poemEl.style.color = '#f0f0f0'; authorEl.style.color = '#aaa';  
-                    }
-                } else {
-                    authorEl.style.display = 'none';
-                    poemEl.style.color = '#f0f0f0';
-                }
+                await new Promise(r => setTimeout(r, 800)); // Fast fade
 
-                const dateObj = new Date(memory.date);
-                if (dateObj.getFullYear() > 1980) {
-                    dateEl.innerText = dateObj.toLocaleDateString('pt-PT', { year: 'numeric', month: 'long', day: 'numeric' }).toUpperCase();
-                } else {
-                    dateEl.innerText = ""; 
-                }
+                renderMemory(memory);
 
                 loaderEl.style.opacity = 0;
-                
-                // Fade In
                 photoEl.style.opacity = 1;
                 poemEl.style.opacity = 1;
                 if (memory.type === 'quote') authorEl.style.opacity = 1;
                 dateEl.style.opacity = 1;
 
-                // Queue next
+                // --- 3. PREPARE NEXT ---
                 nextMemoryPromise = fetchNextMemory();
                 displayTimer = setTimeout(updateDisplay, currentInterval);
+
             } catch (error) {
                 console.error("Display update failed:", error);
                 displayTimer = setTimeout(updateDisplay, 5000);
             }
         }
 
-        // --- INTERACTION HANDLERS ---
+        // --- NAVIGATION ACTIONS ---
 
-        document.getElementById('trigger-layer').addEventListener('pointerdown', () => {
+        document.getElementById('zone-left').addEventListener('click', () => {
+            if (historyStack.length === 0) return; 
+            updateDisplay(true); 
+        });
+
+        document.getElementById('zone-center').addEventListener('click', () => {
+            if (displayTimer) clearTimeout(displayTimer); 
             menuOverlay.classList.add('overlay-visible');
         });
+
+        document.getElementById('zone-right').addEventListener('click', () => {
+            // Visual feedback for Next
+            loaderEl.style.opacity = 1;
+            updateDisplay(false); 
+        });
+
+
+        // --- MENU ACTIONS ---
 
         menuOverlay.addEventListener('click', (e) => { 
             if (e.target === menuOverlay) menuActions.close(); 
@@ -279,61 +333,63 @@
         });
 
         const menuActions = {
-            close: () => menuOverlay.classList.remove('overlay-visible'),
+            close: () => {
+                menuOverlay.classList.remove('overlay-visible');
+                if (displayTimer) clearTimeout(displayTimer);
+                displayTimer = setTimeout(updateDisplay, currentInterval);
+            },
             
             favorite: async () => {
                 if (!currentMemory) return;
                 try {
-                    const currentPath = decodeURIComponent(currentMemory.imagePathEncoded);
                     const res = await fetch('/api/favorite', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ currentPath })
+                        body: JSON.stringify({ currentPath: decodeURIComponent(currentMemory.imagePathEncoded) })
                     });
                     const data = await res.json();
                     if (data.success) {
-                        alert("❤️ Photo added to favorites!");
+                        alert("❤️ Favorited!");
                         menuActions.close();
-                    } else {
-                        alert("Error: " + (data.error || data.message));
-                    }
+                    } else alert("Error: " + (data.error || "Unknown"));
                 } catch(e) { alert("Failed to favorite."); }
             },
 
             confirmDelete: () => {
                 if (!currentMemory) return;
-                menuActions.close();
+                menuOverlay.classList.remove('overlay-visible'); 
                 deletePreviewEl.src = currentMemory.imageSrc;
                 deleteOverlay.classList.add('overlay-visible');
             },
 
-            cancelDelete: () => deleteOverlay.classList.remove('overlay-visible'),
+            cancelDelete: () => {
+                deleteOverlay.classList.remove('overlay-visible');
+                displayTimer = setTimeout(updateDisplay, currentInterval);
+            },
 
             doDelete: async () => {
                 if (!currentMemory) return;
                 try {
-                    const currentPath = decodeURIComponent(currentMemory.imagePathEncoded);
                     const res = await fetch('/api/photo', {
                         method: 'DELETE',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ currentPath })
+                        body: JSON.stringify({ currentPath: decodeURIComponent(currentMemory.imagePathEncoded) })
                     });
                     
                     if (res.ok) {
-                        menuActions.cancelDelete();
-                        loaderEl.style.opacity = 1; 
-                        loaderEl.innerText = "Deleting...";
+                        deleteOverlay.classList.remove('overlay-visible');
+                        loaderEl.style.opacity = 1; loaderEl.innerText = "Deleting...";
                         nextMemoryPromise = null; 
-                        updateDisplay();
+                        updateDisplay(false);
                     } else {
-                        const errData = await res.json();
-                        alert("Failed to delete: " + (errData.error || "Unknown error"));
+                        const err = await res.json();
+                        alert("Failed: " + err.error);
                     }
-                } catch(e) { alert("Error deleting file: " + e.message); }
+                } catch(e) { alert("Error deleting."); }
             },
 
             reindex: async () => {
-                if (confirm("Re-index Library?")) {
+                if (confirm("Re-index?")) {
                     menuActions.close();
                     loaderEl.style.opacity = 1; loaderEl.innerText = "Re-indexing...";
                     try { await fetch('/api/reindex', { method: 'POST' }); } catch (e) {}
@@ -342,9 +398,9 @@
             },
             reload: () => window.location.reload(),
             exit: async () => {
-                if (confirm("Exit Application?")) {
+                if (confirm("Exit?")) {
                     await fetch('/api/exit', { method: 'POST' });
-                    document.body.innerHTML = "<h1 style='color:white;text-align:center;margin-top:20%'>Shutting Down...</h1>";
+                    document.body.innerHTML = "<h1 style='color:white;text-align:center;margin-top:20%'>Bye!</h1>";
                 }
             }
         };
