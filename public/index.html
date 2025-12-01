@@ -11,7 +11,8 @@
             margin: 0; padding: 0; width: 100%; height: 100%;
             background-color: #000; color: #fff; overflow: hidden;
             font-family: 'Merriweather', serif; user-select: none;
-            /* JS handles cursor visibility now */
+            /* HIDE CURSOR BY DEFAULT */
+            cursor: none; 
         }
 
         #app { position: relative; width: 100vw; height: 100vh; }
@@ -48,9 +49,18 @@
             font-family: 'Montserrat', sans-serif; font-size: 0.85rem; color: #888;
             letter-spacing: 1px; opacity: 0; transition: opacity 2s ease-in-out 1s;
         }
-        #loader {
-            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            color: #333; font-family: sans-serif; transition: opacity 0.5s;
+
+        /* NEW LOADING OVERLAY (Replaces old loader) */
+        #loader-overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.7); /* Dim background */
+            z-index: 3000; /* Above everything */
+            display: flex; justify-content: center; align-items: center;
+            opacity: 0; pointer-events: none; transition: opacity 0.3s;
+        }
+        #loader-overlay.visible { opacity: 1; pointer-events: auto; }
+        #loader-text {
+            font-family: 'Montserrat', sans-serif; font-size: 1.5rem; letter-spacing: 2px; color: #fff;
         }
 
         /* CLICK ZONES */
@@ -102,7 +112,10 @@
 <body>
 
     <div id="app">
-        <div id="loader">Curating memories...</div>
+        <!-- New Full Screen Loader -->
+        <div id="loader-overlay" class="visible">
+            <div id="loader-text">Loading Memories...</div>
+        </div>
         
         <div id="photo-container">
             <img id="main-photo" src="" alt="Memory">
@@ -116,7 +129,7 @@
             <div id="date-display"></div>
         </div>
 
-        <!-- 3 CLICK ZONES -->
+        <!-- CLICK ZONES -->
         <div id="zone-left" class="click-zone"></div>
         <div id="zone-center" class="click-zone"></div>
         <div id="zone-right" class="click-zone"></div>
@@ -171,13 +184,19 @@
         let currentMemory = null; 
         let historyStack = []; 
         const HISTORY_LIMIT = 25;
+        
+        // GLOBAL LOCK - Prevents double taps or actions while busy
+        let isProcessing = false;
 
         // Elements
         const photoEl = document.getElementById('main-photo');
         const poemEl = document.getElementById('poem-text');
         const authorEl = document.getElementById('author-text');
         const dateEl = document.getElementById('date-display');
-        const loaderEl = document.getElementById('loader');
+        
+        const loaderOverlay = document.getElementById('loader-overlay');
+        const loaderText = document.getElementById('loader-text');
+        
         const menuOverlay = document.getElementById('menu-overlay');
         const deleteOverlay = document.getElementById('delete-confirm-overlay');
         const deletePreviewEl = document.getElementById('delete-preview-img');
@@ -188,13 +207,24 @@
         sliderEl.value = currentInterval / 1000;
         intervalDisplayEl.innerText = `${sliderEl.value}s`;
 
+        // --- UI HELPERS ---
+        
+        function showLoader(msg = "Loading...") {
+            loaderText.innerText = msg;
+            loaderOverlay.classList.add('visible');
+        }
+
+        function hideLoader() {
+            loaderOverlay.classList.remove('visible');
+        }
+
         // --- MOUSE AUTOHIDE LOGIC ---
         let mouseTimer = null;
         document.addEventListener('mousemove', () => {
             document.body.style.cursor = 'default';
             if (mouseTimer) clearTimeout(mouseTimer);
             mouseTimer = setTimeout(() => {
-                // Only hide if menu is NOT open
+                // Only hide if menus are closed
                 if (!menuOverlay.classList.contains('overlay-visible') && 
                     !deleteOverlay.classList.contains('overlay-visible')) {
                     document.body.style.cursor = 'none';
@@ -248,22 +278,28 @@
         }
 
         async function updateDisplay(useHistory = false) {
+            // Guard: Prevent rapid updates
+            if (isProcessing) return;
+            isProcessing = true; // Lock UI
+
             try {
                 if (displayTimer) clearTimeout(displayTimer);
 
-                // Show loader only if we are manually navigating
-                if (!nextMemoryPromise && !useHistory) loaderEl.style.opacity = 1;
+                // Show loader immediately if we are switching manually (not auto-timer)
+                // We check if nextMemoryPromise is ready; if null, we are definitely loading.
+                if (!nextMemoryPromise && !useHistory) {
+                    showLoader("Loading...");
+                }
 
                 // --- 1. GET DATA ---
                 let memory;
                 if (useHistory && historyStack.length > 0) {
                     memory = historyStack.pop();
-                    // Invalidate forward promise to sync
                     nextMemoryPromise = null; 
                 } else {
                     if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                     
-                    // Add current to history before switching
+                    // Add current to history
                     if (currentMemory) {
                         historyStack.push(currentMemory);
                         if (historyStack.length > HISTORY_LIMIT) historyStack.shift();
@@ -280,41 +316,49 @@
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
                 
-                await new Promise(r => setTimeout(r, 800)); // Fast fade
+                await new Promise(r => setTimeout(r, 800)); // Fade out
 
                 renderMemory(memory);
+                
+                // Hide loader now that content is ready
+                hideLoader();
 
-                loaderEl.style.opacity = 0;
                 photoEl.style.opacity = 1;
                 poemEl.style.opacity = 1;
                 if (memory.type === 'quote') authorEl.style.opacity = 1;
                 dateEl.style.opacity = 1;
 
                 // --- 3. PREPARE NEXT ---
+                isProcessing = false; // Unlock UI
                 nextMemoryPromise = fetchNextMemory();
                 displayTimer = setTimeout(updateDisplay, currentInterval);
 
             } catch (error) {
                 console.error("Display update failed:", error);
+                isProcessing = false;
                 displayTimer = setTimeout(updateDisplay, 5000);
             }
         }
 
-        // --- NAVIGATION ACTIONS ---
+        // --- NAVIGATION HANDLERS ---
 
         document.getElementById('zone-left').addEventListener('click', () => {
+            // Block navigation if menu is open OR already processing
+            if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
             if (historyStack.length === 0) return; 
             updateDisplay(true); 
         });
 
         document.getElementById('zone-center').addEventListener('click', () => {
+            if (isProcessing) return;
             if (displayTimer) clearTimeout(displayTimer); 
             menuOverlay.classList.add('overlay-visible');
         });
 
         document.getElementById('zone-right').addEventListener('click', () => {
-            // Visual feedback for Next
-            loaderEl.style.opacity = 1;
+            if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
+            // Visual feedback
+            showLoader("Loading...");
             updateDisplay(false); 
         });
 
@@ -340,7 +384,10 @@
             },
             
             favorite: async () => {
-                if (!currentMemory) return;
+                if (!currentMemory || isProcessing) return;
+                isProcessing = true;
+                showLoader("Favoriting..."); // Immediate visual feedback
+                
                 try {
                     const res = await fetch('/api/favorite', {
                         method: 'POST',
@@ -348,11 +395,19 @@
                         body: JSON.stringify({ currentPath: decodeURIComponent(currentMemory.imagePathEncoded) })
                     });
                     const data = await res.json();
+                    
+                    hideLoader();
+                    isProcessing = false;
+
                     if (data.success) {
                         alert("❤️ Favorited!");
                         menuActions.close();
                     } else alert("Error: " + (data.error || "Unknown"));
-                } catch(e) { alert("Failed to favorite."); }
+                } catch(e) { 
+                    hideLoader();
+                    isProcessing = false;
+                    alert("Failed to favorite."); 
+                }
             },
 
             confirmDelete: () => {
@@ -368,7 +423,10 @@
             },
 
             doDelete: async () => {
-                if (!currentMemory) return;
+                if (!currentMemory || isProcessing) return;
+                isProcessing = true;
+                showLoader("Deleting..."); // Immediate feedback, blocks UI
+                
                 try {
                     const res = await fetch('/api/photo', {
                         method: 'DELETE',
@@ -378,29 +436,38 @@
                     
                     if (res.ok) {
                         deleteOverlay.classList.remove('overlay-visible');
-                        loaderEl.style.opacity = 1; loaderEl.innerText = "Deleting...";
+                        
+                        // Wait a tiny bit to ensure loader is visible before blocking on next load
                         nextMemoryPromise = null; 
-                        updateDisplay(false);
+                        isProcessing = false; // Unlock momentarily so updateDisplay can run
+                        updateDisplay(false); // This will re-trigger loading state
                     } else {
                         const err = await res.json();
+                        hideLoader();
+                        isProcessing = false;
                         alert("Failed: " + err.error);
                     }
-                } catch(e) { alert("Error deleting."); }
+                } catch(e) { 
+                    hideLoader();
+                    isProcessing = false;
+                    alert("Error deleting."); 
+                }
             },
 
             reindex: async () => {
                 if (confirm("Re-index?")) {
                     menuActions.close();
-                    loaderEl.style.opacity = 1; loaderEl.innerText = "Re-indexing...";
+                    showLoader("Re-indexing...");
                     try { await fetch('/api/reindex', { method: 'POST' }); } catch (e) {}
-                    setTimeout(() => loaderEl.innerText = "", 5000);
+                    // Hide loader after a few seconds, index runs in bg
+                    setTimeout(() => hideLoader(), 5000);
                 }
             },
             reload: () => window.location.reload(),
             exit: async () => {
                 if (confirm("Exit?")) {
+                    showLoader("Shutting Down...");
                     await fetch('/api/exit', { method: 'POST' });
-                    document.body.innerHTML = "<h1 style='color:white;text-align:center;margin-top:20%'>Bye!</h1>";
                 }
             }
         };
