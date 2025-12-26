@@ -18,20 +18,18 @@ app.use(express.static('public'));
 // --- CONFIGURATION ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// Default to the new Gemini 3 model, but allow .env override
-const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Default to the latest Gemini flash, but allow .env override
+const modelName = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
 // FIXED: Force 'v1beta' API version to access the latest Preview models like Gemini 3
-// Cast to 'any' to bypass TypeScript definition issues if older SDK
 const model = genAI.getGenerativeModel({ 
-    model: modelName
-},
-{ 
+    model: modelName,
     apiVersion: 'v1beta' 
-});
+} as any);
 
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH;
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
+const OMITTED_FOLDER_NAME = '_photoframe_omitted';
 const ERROR_IMAGE_MARKER = 'SYSTEM_ERROR_IMAGE';
 
 // --- CACHE SETUP ---
@@ -329,6 +327,7 @@ app.post('/api/favorite', (req, res) => {
 
         if (currentPath === newPath) return res.json({message: "Already in favorites"});
         
+        // Handle name collisions
         if (fs.existsSync(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
@@ -336,14 +335,17 @@ app.post('/api/favorite', (req, res) => {
              newPath = path.join(defaultsDir, `${name}_${timestamp}${ext}`);
         }
 
+        // Move file
         fs.renameSync(currentPath, newPath);
 
+        // Update In-Memory Data
         const photoEntry = photoLibrary.find(p => p.path === currentPath);
         if (photoEntry) photoEntry.path = newPath;
         
         photoPaths.delete(currentPath);
         photoPaths.add(newPath);
 
+        // Update Text Cache Key
         if (textLibrary[currentPath]) {
             textLibrary[newPath] = textLibrary[currentPath];
             delete textLibrary[currentPath];
@@ -356,6 +358,52 @@ app.post('/api/favorite', (req, res) => {
         res.json({ success: true, newPath });
     } catch(e: any) {
         console.error("Favorite Error:", e);
+        res.status(500).json({error: e.message});
+    }
+});
+
+// OMIT PHOTO (New)
+app.post('/api/omit', (req, res) => {
+    try {
+        const { currentPath } = req.body;
+        if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
+        if (!NAS_ROOT_PATH) return res.status(500).json({error: "NAS Root not configured"});
+
+        const omittedDir = path.join(NAS_ROOT_PATH, OMITTED_FOLDER_NAME);
+        if (!fs.existsSync(omittedDir)) fs.mkdirSync(omittedDir, {recursive: true});
+
+        let fileName = path.basename(currentPath);
+        let newPath = path.join(omittedDir, fileName);
+
+        if (currentPath === newPath) return res.json({message: "Already omitted"});
+        
+        // Handle name collisions
+        if (fs.existsSync(newPath)) {
+             const timestamp = Date.now();
+             const ext = path.extname(fileName);
+             const name = path.basename(fileName, ext);
+             newPath = path.join(omittedDir, `${name}_${timestamp}${ext}`);
+        }
+
+        // Move file
+        fs.renameSync(currentPath, newPath);
+
+        // Remove from In-Memory Data (unlike favorite, we don't want to see this again)
+        photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
+        photoPaths.delete(currentPath);
+
+        // Clean up text cache
+        if (textLibrary[currentPath]) {
+            delete textLibrary[currentPath];
+            saveTextsToDisk();
+        }
+
+        isDirtyPhotos = true;
+        savePhotosToDisk();
+
+        res.json({ success: true, newPath });
+    } catch(e: any) {
+        console.error("Omit Error:", e);
         res.status(500).json({error: e.message});
     }
 });

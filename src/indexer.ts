@@ -6,6 +6,7 @@ dotenv.config();
 
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH || './test-photos'; 
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
+const OMITTED_FOLDER_NAME = '_photoframe_omitted';
 const EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const BATCH_SIZE = 50; 
 
@@ -27,7 +28,6 @@ let totalFiles = 0;
 function sendBatch(photos: Photo[], cb?: () => void) {
     if (hasIPC) {
         // FIXED: Cast process to 'any' to bypass TypeScript overload confusion.
-        // Node.js runtime supports (message, callback), but TS definitions can be strict.
         (process as any).send({ type: 'batch', photos: photos }, (err: any) => {
             if (cb) cb();
         });
@@ -40,7 +40,7 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
     if (!fs.existsSync(dir)) return;
 
     totalDirs++;
-    // Log progress every 100 directories so you know it's alive
+    // Log progress every 100 directories
     if (totalDirs % 100 === 0) process.stdout.write(`\r📂 Scanned ${totalDirs} directories...`);
 
     try {
@@ -48,8 +48,8 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
         const files = fs.readdirSync(dir).sort().reverse();
 
         for (const file of files) {
-            // Skip hidden files or Synology thumbnails (@eaDir)
-            if (file.startsWith('.') || file.startsWith('@')) continue;
+            // Skip hidden files, Synology thumbnails (@eaDir), OR the OMITTED folder
+            if (file.startsWith('.') || file.startsWith('@') || file === OMITTED_FOLDER_NAME) continue;
 
             const filePath = path.join(dir, file);
             let stat;
@@ -57,7 +57,7 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
             try {
                 // Use lstat to check for symlinks first to avoid loops
                 const lstat = fs.lstatSync(filePath);
-                if (lstat.isSymbolicLink()) continue; // Skip symlinks for safety
+                if (lstat.isSymbolicLink()) continue; 
                 
                 stat = fs.statSync(filePath);
             } catch (e) { continue; }
@@ -74,7 +74,6 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
                     });
 
                     if (batchBuffer.length >= BATCH_SIZE) {
-                        // Send a copy of the buffer
                         sendBatch([...batchBuffer]);
                         batchBuffer.length = 0; 
                     }
