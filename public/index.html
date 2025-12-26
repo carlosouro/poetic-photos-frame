@@ -53,8 +53,8 @@
         /* FULL SCREEN LOADER */
         #loader-overlay {
             position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-            background: rgba(0,0,0,0.7); /* Dim background */
-            z-index: 3000; /* Above everything */
+            background: rgba(0,0,0,0.7); 
+            z-index: 3000; 
             display: flex; justify-content: center; align-items: center;
             opacity: 0; pointer-events: none; transition: opacity 0.3s;
         }
@@ -103,7 +103,34 @@
 
         .setting-group { display: flex; flex-direction: column; gap: 8px; background: #222; padding: 12px; border-radius: 8px; }
         .setting-label { font-family: 'Montserrat', sans-serif; font-size: 0.9rem; color: #aaa; display: flex; justify-content: space-between; }
-        input[type=range] { width: 100%; accent-color: #f0f0f0; cursor: pointer; }
+        
+        /* IMPROVED TOUCH SLIDER CSS */
+        input[type=range] { 
+            width: 100%; 
+            -webkit-appearance: none; /* Remove default styling */
+            appearance: none;
+            height: 15px; /* Thicker track */
+            background: #444;
+            border-radius: 10px;
+            outline: none;
+            margin: 10px 0;
+            cursor: pointer;
+            /* CRITICAL: Prevents browser scrolling/gestures while sliding */
+            touch-action: none; 
+        }
+
+        /* The Slider Handle (Thumb) - Much Bigger */
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 40px; /* Big touch target */
+            height: 40px;
+            border-radius: 50%;
+            background: #f0f0f0;
+            cursor: pointer;
+            border: 2px solid #1a1a1a;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.5);
+        }
 
         #delete-preview-img { max-width: 200px; max-height: 200px; border-radius: 8px; margin: 10px auto; border: 2px solid #c0392b; }
         .delete-msg { color: #aaa; font-size: 0.9rem; margin-bottom: 10px; }
@@ -203,6 +230,7 @@
         const sliderEl = document.getElementById('interval-slider');
         const intervalDisplayEl = document.getElementById('interval-display');
 
+        // Init Slider
         sliderEl.value = currentInterval / 1000;
         intervalDisplayEl.innerText = `${sliderEl.value}s`;
 
@@ -220,7 +248,11 @@
         // --- MOUSE AUTOHIDE ---
         let mouseTimer = null;
         document.addEventListener('mousemove', () => {
-            document.body.style.cursor = 'default';
+            // Optimization: Only touch style if needed
+            if (document.body.style.cursor !== 'default') {
+                document.body.style.cursor = 'default';
+            }
+            
             if (mouseTimer) clearTimeout(mouseTimer);
             mouseTimer = setTimeout(() => {
                 if (!menuOverlay.classList.contains('overlay-visible') && 
@@ -233,7 +265,6 @@
         // --- CORE LOGIC ---
 
         async function fetchNextMemory() {
-            // TIMEOUT CONTROLLER (15 seconds)
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 15000);
 
@@ -249,13 +280,11 @@
                     img.src = `/api/image?path=${data.imagePathEncoded}`;
                     img.onload = () => resolve({ ...data, imageSrc: img.src });
                     img.onerror = () => reject("Image load failed");
-                    
-                    // Also timeout the image load itself
                     setTimeout(() => reject("Image load timed out"), 15000);
                 });
             } catch (error) {
                 console.error("Fetch failed:", error);
-                throw error; // Propagate error so updateDisplay handles it
+                throw error;
             }
         }
 
@@ -267,7 +296,6 @@
                 authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
                 authorEl.style.display = 'block';
                 
-                // Red text for errors
                 if (memory.author === 'System Alert') {
                     poemEl.style.color = '#ff6b6b'; authorEl.style.color = '#ff6b6b';
                 } else {
@@ -293,7 +321,6 @@
             try {
                 if (displayTimer) clearTimeout(displayTimer);
 
-                // Show loader if manually navigating
                 if (!nextMemoryPromise && !useHistory) {
                     showLoader("Loading...");
                 }
@@ -315,13 +342,12 @@
 
                 currentMemory = memory;
 
-                // Animate Swap
                 photoEl.style.opacity = 0;
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
                 
-                await new Promise(r => setTimeout(r, 500)); 
+                await new Promise(r => setTimeout(r, 800)); 
 
                 renderMemory(memory);
                 hideLoader();
@@ -331,22 +357,16 @@
                 if (memory.type === 'quote') authorEl.style.opacity = 1;
                 dateEl.style.opacity = 1;
 
-                // Queue next
-                nextMemoryPromise = fetchNextMemory().catch(e => console.warn("Background fetch failed, will retry later"));
+                isProcessing = false; 
+                nextMemoryPromise = fetchNextMemory().catch(e => console.warn("Background fetch failed"));
                 displayTimer = setTimeout(updateDisplay, currentInterval);
 
             } catch (error) {
                 console.error("Display update failed:", error);
-                
-                // If we failed, show visual feedback so user knows it's not just "stuck"
                 showLoader("Retrying Connection...");
-                
-                // Clear promise to force fresh fetch next time
                 nextMemoryPromise = null;
                 displayTimer = setTimeout(updateDisplay, 5000);
-                
             } finally {
-                // CRITICAL: Always unlock the UI
                 isProcessing = false;
             }
         }
@@ -367,6 +387,7 @@
 
         document.getElementById('zone-right').addEventListener('click', () => {
             if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
+            showLoader("Loading...");
             updateDisplay(false); 
         });
 
@@ -443,10 +464,8 @@
                     
                     if (res.ok) {
                         deleteOverlay.classList.remove('overlay-visible');
-                        
                         nextMemoryPromise = null; 
                         isProcessing = false; 
-                        // Force immediate update
                         updateDisplay(false); 
                     } else {
                         const err = await res.json();
