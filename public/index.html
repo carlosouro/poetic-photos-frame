@@ -181,9 +181,7 @@
                     <input type="range" id="interval-slider" min="10" max="240" step="10" value="30">
                 </div>
 
-                <button class="btn btn-fav" onclick="menuActions.favorite()">
-                    <span>❤️</span> Favorite Photo
-                </button>
+                <!-- Redundant Favorite button removed -->
 
                 <button class="btn btn-omit" onclick="menuActions.omit()">
                     <span>🚫</span> Omit Photo
@@ -263,12 +261,14 @@
         // --- MOUSE AUTOHIDE ---
         let mouseTimer = null;
         document.addEventListener('mousemove', () => {
+            // Optimization: Only touch style if needed
             if (document.body.style.cursor !== 'default') {
                 document.body.style.cursor = 'default';
             }
             
             if (mouseTimer) clearTimeout(mouseTimer);
             mouseTimer = setTimeout(() => {
+                // Only hide if menus are closed
                 if (!menuOverlay.classList.contains('overlay-visible') && 
                     !deleteOverlay.classList.contains('overlay-visible')) {
                     document.body.style.cursor = 'none';
@@ -279,6 +279,7 @@
         // --- CORE LOGIC ---
 
         async function fetchNextMemory() {
+            // TIMEOUT CONTROLLER (15 seconds)
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 15000);
 
@@ -294,6 +295,8 @@
                     img.src = `/api/image?path=${data.imagePathEncoded}`;
                     img.onload = () => resolve({ ...data, imageSrc: img.src });
                     img.onerror = () => reject("Image load failed");
+                    
+                    // Also timeout the image load itself
                     setTimeout(() => reject("Image load timed out"), 15000);
                 });
             } catch (error) {
@@ -314,6 +317,7 @@
                 authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
                 authorEl.style.display = 'block';
                 
+                // Red text for errors
                 if (memory.author === 'System Alert') {
                     poemEl.style.color = '#ff6b6b'; authorEl.style.color = '#ff6b6b';
                 } else {
@@ -339,6 +343,7 @@
             try {
                 if (displayTimer) clearTimeout(displayTimer);
 
+                // Show loader if manually navigating
                 if (!nextMemoryPromise && !useHistory) {
                     showLoader("Loading...");
                 }
@@ -360,6 +365,7 @@
 
                 currentMemory = memory;
 
+                // Animate Swap
                 photoEl.style.opacity = 0;
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
@@ -375,16 +381,22 @@
                 if (memory.type === 'quote') authorEl.style.opacity = 1;
                 dateEl.style.opacity = 1;
 
-                isProcessing = false; 
-                nextMemoryPromise = fetchNextMemory().catch(e => console.warn("Background fetch failed"));
+                // Queue next
+                nextMemoryPromise = fetchNextMemory().catch(e => console.warn("Background fetch failed, will retry later"));
                 displayTimer = setTimeout(updateDisplay, currentInterval);
 
             } catch (error) {
                 console.error("Display update failed:", error);
+                
+                // If we failed, show visual feedback so user knows it's not just "stuck"
                 showLoader("Retrying Connection...");
+                
+                // Clear promise to force fresh fetch next time
                 nextMemoryPromise = null;
                 displayTimer = setTimeout(updateDisplay, 5000);
+                
             } finally {
+                // CRITICAL: Always unlock the UI
                 isProcessing = false;
             }
         }
@@ -405,6 +417,7 @@
 
         document.getElementById('zone-right').addEventListener('click', () => {
             if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
+            // Visual feedback
             showLoader("Loading...");
             updateDisplay(false); 
         });
@@ -475,6 +488,7 @@
 
             omit: async () => {
                 if (!currentMemory || isProcessing) return;
+                // Removed confirmation dialog here
                 
                 isProcessing = true;
                 showLoader("Omitting...");
@@ -530,8 +544,10 @@
                     
                     if (res.ok) {
                         deleteOverlay.classList.remove('overlay-visible');
+                        
                         nextMemoryPromise = null; 
                         isProcessing = false; 
+                        // Force immediate update
                         updateDisplay(false); 
                     } else {
                         const err = await res.json();
@@ -551,6 +567,7 @@
                     menuActions.close();
                     showLoader("Re-indexing...");
                     try { await fetch('/api/reindex', { method: 'POST' }); } catch (e) {}
+                    // Hide loader after a few seconds, index runs in bg
                     setTimeout(() => hideLoader(), 5000);
                 }
             },
