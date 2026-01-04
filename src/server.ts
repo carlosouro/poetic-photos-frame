@@ -30,6 +30,7 @@ const model = genAI.getGenerativeModel({
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH;
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
 const OMITTED_FOLDER_NAME = '_photoframe_omitted';
+const UNFAVORITED_FOLDER_NAME = '_photoframe_unfavorited';
 const ERROR_IMAGE_MARKER = 'SYSTEM_ERROR_IMAGE';
 
 // --- CACHE SETUP ---
@@ -106,7 +107,6 @@ function selectSmartPhoto(): Photo | null {
     const msPerDay = 1000 * 60 * 60 * 24;
 
     // 1. Identify Favorites (Photos located in the defaults folder)
-    // We check if the path string contains the defaults folder name
     const favorites = photoLibrary.filter(p => p.path.includes(DEFAULTS_FOLDER_NAME));
 
     // 2. Identify Smart Candidates (Recent 30 Days + On This Day)
@@ -114,7 +114,7 @@ function selectSmartPhoto(): Photo | null {
         const pDate = new Date(photo.created);
         if (isNaN(pDate.getTime())) return false;
 
-        // A. Recent check (last 30 days - updated from 10)
+        // A. Recent check (last 30 days)
         const diffTime = now.getTime() - pDate.getTime();
         const diffDays = diffTime / msPerDay;
         if (diffDays >= 0 && diffDays <= 30) return true;
@@ -130,7 +130,7 @@ function selectSmartPhoto(): Photo | null {
     });
 
     // 3. Weighted Selection Logic
-    const roll = Math.random(); // 0.0 to 1.0
+    const roll = Math.random(); 
 
     // 80% Chance: Try Smart Candidates
     if (roll < 0.8) {
@@ -150,7 +150,7 @@ function selectSmartPhoto(): Photo | null {
         }
     }
 
-    // 10% Chance (Roll 0.9 to 1.0) OR Fallback from above: Random Library
+    // 10% Chance (Roll 0.9 to 1.0) OR Fallback: Random Library
     return photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
 }
 
@@ -227,8 +227,6 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
         const result = await model.generateContent([prompt, imagePart]);
         return result.response.text();
     } catch (error: any) {
-        // If we get a 404 on "v1", it means our configuration failed to apply.
-        // We can't retry that away, so we throw immediately for 404s.
         if (error.message?.includes('404')) throw error;
 
         if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded'))) {
@@ -255,10 +253,8 @@ app.get('/api/next-memory', async (req, res) => {
             return res.status(503).json({ error: "Library empty or indexing..." });
         }
 
-        // 1. SELECT PHOTO using new weighted logic
+        // 1. SELECT PHOTO
         let selectedPhoto = selectSmartPhoto();
-        
-        // Final Safety fallback
         if (!selectedPhoto) {
              selectedPhoto = photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
         }
@@ -268,6 +264,9 @@ app.get('/api/next-memory', async (req, res) => {
             photoPaths.delete(selectedPhoto.path);
             return res.status(500).json({ error: "File missing" });
         }
+
+        // Check if Favorite based on folder location
+        const isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
 
         let aiResponse: TextEntry;
 
@@ -300,11 +299,9 @@ app.get('/api/next-memory', async (req, res) => {
                 const imagePart = fileToGenerativePart(selectedPhoto.path, "image/jpeg");
                 const text = await generateWithRetry(prompt, imagePart);
                 
-                // Clean up markdown code blocks if present
                 const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
                 aiResponse = JSON.parse(cleanText);
                 
-                // Save to cache
                 textLibrary[selectedPhoto.path] = aiResponse;
                 saveTextsToDisk(); 
             } catch (aiError) {
@@ -318,7 +315,8 @@ app.get('/api/next-memory', async (req, res) => {
             type: aiResponse.type,
             author: aiResponse.author,
             date: selectedPhoto.created,
-            imagePathEncoded: encodeURIComponent(selectedPhoto.path) 
+            imagePathEncoded: encodeURIComponent(selectedPhoto.path),
+            isFavorite: isFavorite 
         });
 
     } catch (error) {
@@ -346,20 +344,24 @@ app.post('/api/favorite', (req, res) => {
         if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
         if (!NAS_ROOT_PATH) return res.status(500).json({error: "NAS Root not configured"});
 
-        const defaultsDir = path.join(NAS_ROOT_PATH, DEFAULTS_FOLDER_NAME);
-        if (!fs.existsSync(defaultsDir)) fs.mkdirSync(defaultsDir, {recursive: true});
+        // Determine Action: Toggle Favorite
+        const isCurrentlyFavorite = currentPath.includes(DEFAULTS_FOLDER_NAME);
+        const targetFolderName = isCurrentlyFavorite ? UNFAVORITED_FOLDER_NAME : DEFAULTS_FOLDER_NAME;
+
+        const targetDir = path.join(NAS_ROOT_PATH, targetFolderName);
+        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, {recursive: true});
 
         let fileName = path.basename(currentPath);
-        let newPath = path.join(defaultsDir, fileName);
+        let newPath = path.join(targetDir, fileName);
 
-        if (currentPath === newPath) return res.json({message: "Already in favorites"});
+        if (currentPath === newPath) return res.json({message: "No change needed", isFavorite: isCurrentlyFavorite});
         
         // Handle name collisions
         if (fs.existsSync(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
              const name = path.basename(fileName, ext);
-             newPath = path.join(defaultsDir, `${name}_${timestamp}${ext}`);
+             newPath = path.join(targetDir, `${name}_${timestamp}${ext}`);
         }
 
         // Move file
@@ -382,7 +384,10 @@ app.post('/api/favorite', (req, res) => {
         isDirtyPhotos = true;
         savePhotosToDisk();
 
-        res.json({ success: true, newPath });
+        // Return new state: if we moved TO defaults, it is now favorite.
+        const isNowFavorite = !isCurrentlyFavorite;
+        res.json({ success: true, newPath, isFavorite: isNowFavorite });
+
     } catch(e: any) {
         console.error("Favorite Error:", e);
         res.status(500).json({error: e.message});
