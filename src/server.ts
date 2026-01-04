@@ -265,18 +265,36 @@ app.get('/api/next-memory', async (req, res) => {
             return res.status(500).json({ error: "File missing" });
         }
 
-        // Check if Favorite based on folder location
         const isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
+        let aiResponse: TextEntry | null = null;
+        let duplicateDetected = false;
+        let textToExclude = "";
 
-        let aiResponse: TextEntry;
-
+        // 2. CHECK CACHE & DETECT DUPLICATES
         if (textLibrary[selectedPhoto.path]) {
             aiResponse = textLibrary[selectedPhoto.path];
-        } else {
-            // 2. HYBRID LOGIC
+            
+            // Iterate text library to find if this content is used elsewhere
+            for (const [otherPath, entry] of Object.entries(textLibrary)) {
+                if (otherPath !== selectedPhoto.path && entry.content === aiResponse.content) {
+                    duplicateDetected = true;
+                    textToExclude = aiResponse.content;
+                    console.log(`♻️  Duplicate content detected for ${path.basename(selectedPhoto.path)}. Refreshing...`);
+                    break;
+                }
+            }
+        }
+
+        // 3. GENERATE (If missing OR Duplicate detected)
+        if (!aiResponse || duplicateDetected) {
             const roll = Math.random();
             const preferredType = roll < 0.3 ? "poem" : "quote"; // 70% Quote bias
             
+            let exclusionInstruction = "";
+            if (duplicateDetected && textToExclude) {
+                exclusionInstruction = `IMPORTANT: The following text was already used. Do NOT use it again: "${textToExclude}". Find something different.`;
+            }
+
             const prompt = `
                 You are a poetic assistant for a digital photo frame. Look at this image.
                 
@@ -285,6 +303,8 @@ app.get('/api/next-memory', async (req, res) => {
                 Preference: I am leaning towards a **${preferredType.toUpperCase()}** for this specific image. 
                 However, please override this preference if the image content clearly suits the other format much better.
                 
+                ${exclusionInstruction}
+
                 Definitions:
                 - Quote: A profound, existing famous quote.
                 - Poem: A short, beautiful poem (max 4 lines).
@@ -302,18 +322,22 @@ app.get('/api/next-memory', async (req, res) => {
                 const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
                 aiResponse = JSON.parse(cleanText);
                 
-                textLibrary[selectedPhoto.path] = aiResponse;
+                // Save to cache
+                textLibrary[selectedPhoto.path] = aiResponse!;
                 saveTextsToDisk(); 
             } catch (aiError) {
                 console.error("Gemini Final Error:", aiError);
-                aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                // If this was a refresh that failed, stick with the old one if available
+                if (!aiResponse) {
+                    aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                }
             }
         }
 
         res.json({
-            text: aiResponse.content,
-            type: aiResponse.type,
-            author: aiResponse.author,
+            text: aiResponse!.content,
+            type: aiResponse!.type,
+            author: aiResponse!.author,
             date: selectedPhoto.created,
             imagePathEncoded: encodeURIComponent(selectedPhoto.path),
             isFavorite: isFavorite 
@@ -384,7 +408,6 @@ app.post('/api/favorite', (req, res) => {
         isDirtyPhotos = true;
         savePhotosToDisk();
 
-        // Return new state: if we moved TO defaults, it is now favorite.
         const isNowFavorite = !isCurrentlyFavorite;
         res.json({ success: true, newPath, isFavorite: isNowFavorite });
 
@@ -409,7 +432,6 @@ app.post('/api/omit', (req, res) => {
 
         if (currentPath === newPath) return res.json({message: "Already omitted"});
         
-        // Handle name collisions
         if (fs.existsSync(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
@@ -417,14 +439,11 @@ app.post('/api/omit', (req, res) => {
              newPath = path.join(omittedDir, `${name}_${timestamp}${ext}`);
         }
 
-        // Move file
         fs.renameSync(currentPath, newPath);
 
-        // Remove from In-Memory Data
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
 
-        // Clean up text cache
         if (textLibrary[currentPath]) {
             delete textLibrary[currentPath];
             saveTextsToDisk();
@@ -445,10 +464,8 @@ app.delete('/api/photo', (req, res) => {
         const { currentPath } = req.body;
         if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
 
-        // Delete from disk
         fs.unlinkSync(currentPath);
 
-        // Remove from memory
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
         
