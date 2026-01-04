@@ -18,10 +18,10 @@ app.use(express.static('public'));
 // --- CONFIGURATION ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// Default to the latest Gemini flash, but allow .env override
+// Default to the latest Flash model for cost efficiency
 const modelName = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
-// FIXED: Force 'v1beta' API version to access the latest Preview models like Gemini 3
+// We use 'v1beta' to ensure access to the latest model aliases
 const model = genAI.getGenerativeModel({ 
     model: modelName,
     apiVersion: 'v1beta' 
@@ -105,17 +105,21 @@ function selectSmartPhoto(): Photo | null {
     const now = new Date();
     const msPerDay = 1000 * 60 * 60 * 24;
 
-    // Filter for "Recent" (Last 10 days) and "On This Day" (+/- 10 days in past years)
+    // 1. Identify Favorites (Photos located in the defaults folder)
+    // We check if the path string contains the defaults folder name
+    const favorites = photoLibrary.filter(p => p.path.includes(DEFAULTS_FOLDER_NAME));
+
+    // 2. Identify Smart Candidates (Recent 30 Days + On This Day)
     const smartCandidates = photoLibrary.filter(photo => {
         const pDate = new Date(photo.created);
         if (isNaN(pDate.getTime())) return false;
 
-        // A. Recent check (last 10 days)
+        // A. Recent check (last 30 days - updated from 10)
         const diffTime = now.getTime() - pDate.getTime();
         const diffDays = diffTime / msPerDay;
-        if (diffDays >= 0 && diffDays <= 10) return true;
+        if (diffDays >= 0 && diffDays <= 30) return true;
 
-        // B. "On This Day" check (ignoring year)
+        // B. "On This Day" check (ignoring year, +/- 10 days)
         const pDateCurrentYear = new Date(pDate);
         pDateCurrentYear.setFullYear(now.getFullYear());
         
@@ -125,12 +129,29 @@ function selectSmartPhoto(): Photo | null {
         return dayDiff <= 10;
     });
 
-    // Strategy: Use smart candidates 70% of the time, Random 30%
-    if (smartCandidates.length > 0 && Math.random() < 0.7) {
-        return smartCandidates[Math.floor(Math.random() * smartCandidates.length)];
-    } else {
-        return photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+    // 3. Weighted Selection Logic
+    const roll = Math.random(); // 0.0 to 1.0
+
+    // 80% Chance: Try Smart Candidates
+    if (roll < 0.8) {
+        if (smartCandidates.length > 0) {
+            return smartCandidates[Math.floor(Math.random() * smartCandidates.length)];
+        }
+        // Fallback: If no smart matches, try favorites
+        if (favorites.length > 0) {
+            return favorites[Math.floor(Math.random() * favorites.length)];
+        }
+    } 
+    
+    // 10% Chance: Try Favorites (Roll 0.8 to 0.9)
+    if (roll < 0.9) {
+        if (favorites.length > 0) {
+            return favorites[Math.floor(Math.random() * favorites.length)];
+        }
     }
+
+    // 10% Chance (Roll 0.9 to 1.0) OR Fallback from above: Random Library
+    return photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
 }
 
 // --- INDEXING LOGIC ---
@@ -206,6 +227,10 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
         const result = await model.generateContent([prompt, imagePart]);
         return result.response.text();
     } catch (error: any) {
+        // If we get a 404 on "v1", it means our configuration failed to apply.
+        // We can't retry that away, so we throw immediately for 404s.
+        if (error.message?.includes('404')) throw error;
+
         if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded'))) {
             await new Promise(r => setTimeout(r, delay));
             return generateWithRetry(prompt, imagePart, retries - 1, delay * 2);
@@ -230,8 +255,10 @@ app.get('/api/next-memory', async (req, res) => {
             return res.status(503).json({ error: "Library empty or indexing..." });
         }
 
-        // 1. SELECT PHOTO
+        // 1. SELECT PHOTO using new weighted logic
         let selectedPhoto = selectSmartPhoto();
+        
+        // Final Safety fallback
         if (!selectedPhoto) {
              selectedPhoto = photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
         }
@@ -362,7 +389,7 @@ app.post('/api/favorite', (req, res) => {
     }
 });
 
-// OMIT PHOTO (New)
+// OMIT PHOTO
 app.post('/api/omit', (req, res) => {
     try {
         const { currentPath } = req.body;
@@ -388,7 +415,7 @@ app.post('/api/omit', (req, res) => {
         // Move file
         fs.renameSync(currentPath, newPath);
 
-        // Remove from In-Memory Data (unlike favorite, we don't want to see this again)
+        // Remove from In-Memory Data
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
 
@@ -413,8 +440,10 @@ app.delete('/api/photo', (req, res) => {
         const { currentPath } = req.body;
         if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
 
+        // Delete from disk
         fs.unlinkSync(currentPath);
 
+        // Remove from memory
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
         
