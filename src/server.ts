@@ -17,11 +17,8 @@ app.use(express.static('public'));
 
 // --- CONFIGURATION ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-
-// Default to the latest Flash model for cost efficiency
 const modelName = process.env.GEMINI_MODEL || "gemini-flash-latest";
 
-// We use 'v1beta' to ensure access to the latest model aliases
 const model = genAI.getGenerativeModel({ 
     model: modelName,
     apiVersion: 'v1beta' 
@@ -38,7 +35,6 @@ const CACHE_DIR = './cache';
 const PHOTOS_JSON_PATH = path.join(CACHE_DIR, 'photos.json');
 const TEXTS_JSON_PATH = path.join(CACHE_DIR, 'texts.json');
 
-// Ensure cache directory exists immediately
 if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
@@ -61,6 +57,9 @@ let textLibrary: Record<string, TextEntry> = {};
 
 let isDirtyPhotos = false; 
 let isIndexing = false; 
+
+// NEW: Global lock to prevent overlapping Gemini API calls
+let isGeneratingAI = false;
 
 // --- PERSISTENCE HELPERS ---
 
@@ -106,20 +105,16 @@ function selectSmartPhoto(): Photo | null {
     const now = new Date();
     const msPerDay = 1000 * 60 * 60 * 24;
 
-    // 1. Identify Favorites (Photos located in the defaults folder)
     const favorites = photoLibrary.filter(p => p.path.includes(DEFAULTS_FOLDER_NAME));
 
-    // 2. Identify Smart Candidates (Recent 30 Days + On This Day)
     const smartCandidates = photoLibrary.filter(photo => {
         const pDate = new Date(photo.created);
         if (isNaN(pDate.getTime())) return false;
 
-        // A. Recent check (last 30 days)
         const diffTime = now.getTime() - pDate.getTime();
         const diffDays = diffTime / msPerDay;
         if (diffDays >= 0 && diffDays <= 30) return true;
 
-        // B. "On This Day" check (ignoring year, +/- 10 days)
         const pDateCurrentYear = new Date(pDate);
         pDateCurrentYear.setFullYear(now.getFullYear());
         
@@ -129,28 +124,23 @@ function selectSmartPhoto(): Photo | null {
         return dayDiff <= 10;
     });
 
-    // 3. Weighted Selection Logic
     const roll = Math.random(); 
 
-    // 80% Chance: Try Smart Candidates
     if (roll < 0.8) {
         if (smartCandidates.length > 0) {
             return smartCandidates[Math.floor(Math.random() * smartCandidates.length)];
         }
-        // Fallback: If no smart matches, try favorites
         if (favorites.length > 0) {
             return favorites[Math.floor(Math.random() * favorites.length)];
         }
     } 
     
-    // 10% Chance: Try Favorites (Roll 0.8 to 0.9)
     if (roll < 0.9) {
         if (favorites.length > 0) {
             return favorites[Math.floor(Math.random() * favorites.length)];
         }
     }
 
-    // 10% Chance (Roll 0.9 to 1.0) OR Fallback: Random Library
     return photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
 }
 
@@ -245,7 +235,8 @@ app.get('/api/next-memory', async (req, res) => {
                 type: 'quote',
                 author: "System Alert",
                 date: new Date().toISOString(),
-                imagePathEncoded: ERROR_IMAGE_MARKER
+                imagePathEncoded: ERROR_IMAGE_MARKER,
+                isFavorite: false
             });
         }
 
@@ -265,7 +256,7 @@ app.get('/api/next-memory', async (req, res) => {
             return res.status(500).json({ error: "File missing" });
         }
 
-        const isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
+        let isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
         let aiResponse: TextEntry | null = null;
         let duplicateDetected = false;
         let textToExclude = "";
@@ -274,7 +265,6 @@ app.get('/api/next-memory', async (req, res) => {
         if (textLibrary[selectedPhoto.path]) {
             aiResponse = textLibrary[selectedPhoto.path];
             
-            // Iterate text library to find if this content is used elsewhere
             for (const [otherPath, entry] of Object.entries(textLibrary)) {
                 if (otherPath !== selectedPhoto.path && entry.content === aiResponse.content) {
                     duplicateDetected = true;
@@ -285,51 +275,72 @@ app.get('/api/next-memory', async (req, res) => {
             }
         }
 
-        // 3. GENERATE (If missing OR Duplicate detected)
+        // 3. GENERATE OR FALLBACK
         if (!aiResponse || duplicateDetected) {
-            const roll = Math.random();
-            const preferredType = roll < 0.3 ? "poem" : "quote"; // 70% Quote bias
             
-            let exclusionInstruction = "";
-            if (duplicateDetected && textToExclude) {
-                exclusionInstruction = `IMPORTANT: The following text was already used. Do NOT use it again: "${textToExclude}". Find something different.`;
-            }
-
-            const prompt = `
-                You are a poetic assistant for a digital photo frame. Look at this image.
+            // CONCURRENCY CHECK: If we are already running an AI request, DO NOT stack another one.
+            // Serve a cached photo instantly instead.
+            if (isGeneratingAI) {
+                console.log("⚠️ Backend is busy generating AI text. Forcing a cached fallback memory.");
+                const cachedPaths = Object.keys(textLibrary);
+                const availableCachedPhotos = photoLibrary.filter(p => cachedPaths.includes(p.path));
                 
-                Goal: Generate text that matches the mood, location, or emotion of the photo.
-                
-                Preference: I am leaning towards a **${preferredType.toUpperCase()}** for this specific image. 
-                However, please override this preference if the image content clearly suits the other format much better.
-                
-                ${exclusionInstruction}
-
-                Definitions:
-                - Quote: A profound, existing famous quote.
-                - Poem: A short, beautiful poem (max 4 lines).
-                
-                Language: Randomly choose between Portuguese (European - PT-PT) or English.
-                
-                Output Format: JSON only.
-                Structure: { "content": "The text", "type": "quote" OR "poem", "author": "Author Name (if quote) or null (if poem)" }
-            `;
-
-            try {
-                const imagePart = fileToGenerativePart(selectedPhoto.path, "image/jpeg");
-                const text = await generateWithRetry(prompt, imagePart);
-                
-                const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-                aiResponse = JSON.parse(cleanText);
-                
-                // Save to cache
-                textLibrary[selectedPhoto.path] = aiResponse!;
-                saveTextsToDisk(); 
-            } catch (aiError) {
-                console.error("Gemini Final Error:", aiError);
-                // If this was a refresh that failed, stick with the old one if available
-                if (!aiResponse) {
+                if (availableCachedPhotos.length > 0) {
+                    selectedPhoto = availableCachedPhotos[Math.floor(Math.random() * availableCachedPhotos.length)];
+                    aiResponse = textLibrary[selectedPhoto.path];
+                    isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
+                } else {
                     aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                }
+            } else {
+                // Not busy, safe to call the API
+                isGeneratingAI = true; 
+                
+                const roll = Math.random();
+                const preferredType = roll < 0.3 ? "poem" : "quote";
+                
+                let exclusionInstruction = "";
+                if (duplicateDetected && textToExclude) {
+                    exclusionInstruction = `IMPORTANT: The following text was already used. Do NOT use it again: "${textToExclude}". Find something different.`;
+                }
+
+                const prompt = `
+                    You are a poetic assistant for a digital photo frame. Look at this image.
+                    
+                    Goal: Generate text that matches the mood, location, or emotion of the photo.
+                    
+                    Preference: I am leaning towards a **${preferredType.toUpperCase()}** for this specific image. 
+                    However, please override this preference if the image content clearly suits the other format much better.
+                    
+                    ${exclusionInstruction}
+
+                    Definitions:
+                    - Quote: A profound, existing famous quote.
+                    - Poem: A short, beautiful poem (max 4 lines).
+                    
+                    Language: Randomly choose between Portuguese (European - PT-PT) or English.
+                    
+                    Output Format: JSON only.
+                    Structure: { "content": "The text", "type": "quote" OR "poem", "author": "Author Name (if quote) or null (if poem)" }
+                `;
+
+                try {
+                    const imagePart = fileToGenerativePart(selectedPhoto.path, "image/jpeg");
+                    const text = await generateWithRetry(prompt, imagePart);
+                    
+                    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+                    aiResponse = JSON.parse(cleanText);
+                    
+                    textLibrary[selectedPhoto.path] = aiResponse!;
+                    saveTextsToDisk(); 
+                } catch (aiError) {
+                    console.error("Gemini Final Error:", aiError);
+                    if (!aiResponse) {
+                        aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                    }
+                } finally {
+                    // ALWAYS unlock when done, even if it failed
+                    isGeneratingAI = false; 
                 }
             }
         }
@@ -368,7 +379,6 @@ app.post('/api/favorite', (req, res) => {
         if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
         if (!NAS_ROOT_PATH) return res.status(500).json({error: "NAS Root not configured"});
 
-        // Determine Action: Toggle Favorite
         const isCurrentlyFavorite = currentPath.includes(DEFAULTS_FOLDER_NAME);
         const targetFolderName = isCurrentlyFavorite ? UNFAVORITED_FOLDER_NAME : DEFAULTS_FOLDER_NAME;
 
@@ -380,7 +390,6 @@ app.post('/api/favorite', (req, res) => {
 
         if (currentPath === newPath) return res.json({message: "No change needed", isFavorite: isCurrentlyFavorite});
         
-        // Handle name collisions
         if (fs.existsSync(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
@@ -388,17 +397,14 @@ app.post('/api/favorite', (req, res) => {
              newPath = path.join(targetDir, `${name}_${timestamp}${ext}`);
         }
 
-        // Move file
         fs.renameSync(currentPath, newPath);
 
-        // Update In-Memory Data
         const photoEntry = photoLibrary.find(p => p.path === currentPath);
         if (photoEntry) photoEntry.path = newPath;
         
         photoPaths.delete(currentPath);
         photoPaths.add(newPath);
 
-        // Update Text Cache Key
         if (textLibrary[currentPath]) {
             textLibrary[newPath] = textLibrary[currentPath];
             delete textLibrary[currentPath];
