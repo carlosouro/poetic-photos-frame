@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
+import { promises as fsPromises } from 'fs'; // NEW: Async File System API
 import path from 'path';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -35,6 +36,7 @@ const CACHE_DIR = './cache';
 const PHOTOS_JSON_PATH = path.join(CACHE_DIR, 'photos.json');
 const TEXTS_JSON_PATH = path.join(CACHE_DIR, 'texts.json');
 
+// Boot-time sync directory creation is fine
 if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
@@ -57,9 +59,21 @@ let textLibrary: Record<string, TextEntry> = {};
 
 let isDirtyPhotos = false; 
 let isIndexing = false; 
-
-// NEW: Global lock to prevent overlapping Gemini API calls
 let isGeneratingAI = false;
+let isSavingPhotos = false;
+let isSavingTexts = false;
+
+// --- ASYNC HELPERS ---
+
+// Safe async check if a file/folder exists without throwing
+async function fileExists(pathStr: string): Promise<boolean> {
+    try {
+        await fsPromises.access(pathStr);
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 // --- PERSISTENCE HELPERS ---
 
@@ -82,19 +96,25 @@ const loadLibraries = () => {
     } catch (e) { console.error("Error loading texts cache:", e); }
 };
 
-const savePhotosToDisk = () => {
-    if (!isDirtyPhotos) return;
+// Converted to ASYNC to prevent blocking the event loop on save
+const savePhotosToDisk = async () => {
+    if (!isDirtyPhotos || isSavingPhotos) return;
+    isSavingPhotos = true;
     try {
-        fs.writeFileSync(PHOTOS_JSON_PATH, JSON.stringify(photoLibrary, null, 2));
+        await fsPromises.writeFile(PHOTOS_JSON_PATH, JSON.stringify(photoLibrary, null, 2));
         console.log(`💾 Persisted ${photoLibrary.length} photos to cache.`);
         isDirtyPhotos = false;
     } catch (e) { console.error("Error saving photos:", e); }
+    finally { isSavingPhotos = false; }
 };
 
-const saveTextsToDisk = () => {
+const saveTextsToDisk = async () => {
+    if (isSavingTexts) return;
+    isSavingTexts = true;
     try {
-        fs.writeFileSync(TEXTS_JSON_PATH, JSON.stringify(textLibrary, null, 2));
+        await fsPromises.writeFile(TEXTS_JSON_PATH, JSON.stringify(textLibrary, null, 2));
     } catch (e) { console.error("Error saving texts:", e); }
+    finally { isSavingTexts = false; }
 };
 
 // --- SMART PHOTO SELECTION ---
@@ -172,7 +192,7 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
 };
 
 const performIndexing = async (clearCache: boolean) => {
-    if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
+    if (NAS_ROOT_PATH && !(await fileExists(NAS_ROOT_PATH))) {
         isIndexing = false;
         return; 
     }
@@ -203,10 +223,12 @@ setInterval(() => {
 
 // --- API LOGIC ---
 
-function fileToGenerativePart(filePath: string, mimeType: string) {
+// ASYNC: Read file to buffer so it doesn't freeze the event loop
+async function fileToGenerativePart(filePath: string, mimeType: string) {
+    const data = await fsPromises.readFile(filePath);
     return {
         inlineData: {
-            data: Buffer.from(fs.readFileSync(filePath)).toString("base64"),
+            data: data.toString("base64"),
             mimeType
         },
     };
@@ -229,15 +251,19 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
 
 app.get('/api/next-memory', async (req, res) => {
     try {
-        if (NAS_ROOT_PATH && !fs.existsSync(NAS_ROOT_PATH)) {
-            return res.json({
-                text: "⚠️ System Alert: Storage not accessible.",
-                type: 'quote',
-                author: "System Alert",
-                date: new Date().toISOString(),
-                imagePathEncoded: ERROR_IMAGE_MARKER,
-                isFavorite: false
-            });
+        // ASYNC: Check NAS existence
+        if (NAS_ROOT_PATH) {
+            const nasMounted = await fileExists(NAS_ROOT_PATH);
+            if (!nasMounted) {
+                return res.json({
+                    text: "⚠️ System Alert: Storage not accessible.",
+                    type: 'quote',
+                    author: "System Alert",
+                    date: new Date().toISOString(),
+                    imagePathEncoded: ERROR_IMAGE_MARKER,
+                    isFavorite: false
+                });
+            }
         }
 
         if (photoLibrary.length === 0) {
@@ -250,9 +276,11 @@ app.get('/api/next-memory', async (req, res) => {
              selectedPhoto = photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
         }
 
-        if (!fs.existsSync(selectedPhoto.path)) {
+        // ASYNC: Check if chosen photo still exists
+        const photoExists = await fileExists(selectedPhoto.path);
+        if (!photoExists) {
             photoLibrary = photoLibrary.filter(p => p.path !== selectedPhoto!.path);
-            photoPaths.delete(selectedPhoto.path);
+            photoPaths.delete(selectedPhoto!.path);
             return res.status(500).json({ error: "File missing" });
         }
 
@@ -278,8 +306,6 @@ app.get('/api/next-memory', async (req, res) => {
         // 3. GENERATE OR FALLBACK
         if (!aiResponse || duplicateDetected) {
             
-            // CONCURRENCY CHECK: If we are already running an AI request, DO NOT stack another one.
-            // Serve a cached photo instantly instead.
             if (isGeneratingAI) {
                 console.log("⚠️ Backend is busy generating AI text. Forcing a cached fallback memory.");
                 const cachedPaths = Object.keys(textLibrary);
@@ -293,7 +319,6 @@ app.get('/api/next-memory', async (req, res) => {
                     aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
                 }
             } else {
-                // Not busy, safe to call the API
                 isGeneratingAI = true; 
                 
                 const roll = Math.random();
@@ -325,7 +350,8 @@ app.get('/api/next-memory', async (req, res) => {
                 `;
 
                 try {
-                    const imagePart = fileToGenerativePart(selectedPhoto.path, "image/jpeg");
+                    // ASYNC image read happens here now!
+                    const imagePart = await fileToGenerativePart(selectedPhoto.path, "image/jpeg");
                     const text = await generateWithRetry(prompt, imagePart);
                     
                     const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -339,7 +365,6 @@ app.get('/api/next-memory', async (req, res) => {
                         aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
                     }
                 } finally {
-                    // ALWAYS unlock when done, even if it failed
                     isGeneratingAI = false; 
                 }
             }
@@ -360,44 +385,50 @@ app.get('/api/next-memory', async (req, res) => {
     }
 });
 
-app.get('/api/image', (req, res) => {
+app.get('/api/image', async (req, res) => {
     const filePath = decodeURIComponent(req.query.path as string);
     if (filePath === ERROR_IMAGE_MARKER) {
         const img = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==", 'base64');
         res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': img.length });
         return res.end(img);
     }
-    if (!filePath || !fs.existsSync(filePath)) return res.status(404).send('Image not found');
+    
+    // ASYNC: Check if image exists before serving
+    const exists = await fileExists(filePath);
+    if (!exists) return res.status(404).send('Image not found');
     res.sendFile(filePath);
 });
 
 // --- MANAGEMENT ENDPOINTS ---
+// All updated to use fsPromises
 
-app.post('/api/favorite', (req, res) => {
+app.post('/api/favorite', async (req, res) => {
     try {
         const { currentPath } = req.body;
-        if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
+        if (!currentPath || !(await fileExists(currentPath))) return res.status(404).json({error: "File not found"});
         if (!NAS_ROOT_PATH) return res.status(500).json({error: "NAS Root not configured"});
 
         const isCurrentlyFavorite = currentPath.includes(DEFAULTS_FOLDER_NAME);
         const targetFolderName = isCurrentlyFavorite ? UNFAVORITED_FOLDER_NAME : DEFAULTS_FOLDER_NAME;
 
         const targetDir = path.join(NAS_ROOT_PATH, targetFolderName);
-        if (!fs.existsSync(targetDir)) fs.mkdirSync(targetDir, {recursive: true});
+        if (!(await fileExists(targetDir))) {
+            await fsPromises.mkdir(targetDir, {recursive: true});
+        }
 
         let fileName = path.basename(currentPath);
         let newPath = path.join(targetDir, fileName);
 
         if (currentPath === newPath) return res.json({message: "No change needed", isFavorite: isCurrentlyFavorite});
         
-        if (fs.existsSync(newPath)) {
+        if (await fileExists(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
              const name = path.basename(fileName, ext);
              newPath = path.join(targetDir, `${name}_${timestamp}${ext}`);
         }
 
-        fs.renameSync(currentPath, newPath);
+        await fsPromises.rename(currentPath, newPath);
 
         const photoEntry = photoLibrary.find(p => p.path === currentPath);
         if (photoEntry) photoEntry.path = newPath;
@@ -423,29 +454,30 @@ app.post('/api/favorite', (req, res) => {
     }
 });
 
-// OMIT PHOTO
-app.post('/api/omit', (req, res) => {
+app.post('/api/omit', async (req, res) => {
     try {
         const { currentPath } = req.body;
-        if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
+        if (!currentPath || !(await fileExists(currentPath))) return res.status(404).json({error: "File not found"});
         if (!NAS_ROOT_PATH) return res.status(500).json({error: "NAS Root not configured"});
 
         const omittedDir = path.join(NAS_ROOT_PATH, OMITTED_FOLDER_NAME);
-        if (!fs.existsSync(omittedDir)) fs.mkdirSync(omittedDir, {recursive: true});
+        if (!(await fileExists(omittedDir))) {
+            await fsPromises.mkdir(omittedDir, {recursive: true});
+        }
 
         let fileName = path.basename(currentPath);
         let newPath = path.join(omittedDir, fileName);
 
         if (currentPath === newPath) return res.json({message: "Already omitted"});
         
-        if (fs.existsSync(newPath)) {
+        if (await fileExists(newPath)) {
              const timestamp = Date.now();
              const ext = path.extname(fileName);
              const name = path.basename(fileName, ext);
              newPath = path.join(omittedDir, `${name}_${timestamp}${ext}`);
         }
 
-        fs.renameSync(currentPath, newPath);
+        await fsPromises.rename(currentPath, newPath);
 
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
@@ -465,12 +497,12 @@ app.post('/api/omit', (req, res) => {
     }
 });
 
-app.delete('/api/photo', (req, res) => {
+app.delete('/api/photo', async (req, res) => {
     try {
         const { currentPath } = req.body;
-        if (!currentPath || !fs.existsSync(currentPath)) return res.status(404).json({error: "File not found"});
+        if (!currentPath || !(await fileExists(currentPath))) return res.status(404).json({error: "File not found"});
 
-        fs.unlinkSync(currentPath);
+        await fsPromises.unlink(currentPath);
 
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
