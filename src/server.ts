@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
-import { promises as fsPromises } from 'fs'; // NEW: Async File System API
+import { promises as fsPromises } from 'fs'; // Async File System API
 import path from 'path';
 import dotenv from 'dotenv';
 import { GoogleGenerativeAI } from '@google/generative-ai';
@@ -63,13 +63,43 @@ let isGeneratingAI = false;
 let isSavingPhotos = false;
 let isSavingTexts = false;
 
-// --- ASYNC HELPERS ---
+// --- NAS CIRCUIT BREAKER ---
+let isNasOffline = false;
+let nasRetryTimestamp = 0;
 
-// Safe async check if a file/folder exists without throwing
+// Centralized safe NAS check
+async function checkNasConnection(): Promise<boolean> {
+    if (!NAS_ROOT_PATH) return false;
+    
+    // If the breaker is tripped, fail instantly so we don't pile up kernel threads
+    if (isNasOffline && Date.now() < nasRetryTimestamp) {
+        return false; 
+    }
+
+    try {
+        const check = fsPromises.access(NAS_ROOT_PATH).then(() => true).catch(() => false);
+        const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000));
+        const isOnline = await Promise.race([check, timeout]);
+        
+        if (!isOnline) {
+            isNasOffline = true;
+            nasRetryTimestamp = Date.now() + 60000; // 60s cooldown period
+            console.error("⚠️ NAS Circuit Breaker Tripped! Cooldown active for 60s.");
+        } else {
+            isNasOffline = false;
+        }
+        return isOnline;
+    } catch {
+        return false;
+    }
+}
+
+// Safe async check if a file/folder exists WITH strict timeout to prevent OS freezing
 async function fileExists(pathStr: string): Promise<boolean> {
     try {
-        await fsPromises.access(pathStr);
-        return true;
+        const check = fsPromises.access(pathStr).then(() => true).catch(() => false);
+        const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 3000));
+        return await Promise.race([check, timeout]);
     } catch {
         return false;
     }
@@ -96,7 +126,6 @@ const loadLibraries = () => {
     } catch (e) { console.error("Error loading texts cache:", e); }
 };
 
-// Converted to ASYNC to prevent blocking the event loop on save
 const savePhotosToDisk = async () => {
     if (!isDirtyPhotos || isSavingPhotos) return;
     isSavingPhotos = true;
@@ -192,7 +221,7 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
 };
 
 const performIndexing = async (clearCache: boolean) => {
-    if (NAS_ROOT_PATH && !(await fileExists(NAS_ROOT_PATH))) {
+    if (NAS_ROOT_PATH && !(await checkNasConnection())) {
         isIndexing = false;
         return; 
     }
@@ -223,7 +252,6 @@ setInterval(() => {
 
 // --- API LOGIC ---
 
-// ASYNC: Read file to buffer so it doesn't freeze the event loop
 async function fileToGenerativePart(filePath: string, mimeType: string) {
     const data = await fsPromises.readFile(filePath);
     return {
@@ -236,12 +264,23 @@ async function fileToGenerativePart(filePath: string, mimeType: string) {
 
 async function generateWithRetry(prompt: string, imagePart: any, retries = 3, delay = 1000): Promise<string> {
     try {
-        const result = await model.generateContent([prompt, imagePart]);
+        // Enforce a strict 20-second timeout on Gemini API calls so network drops don't hang the app forever
+        const timeoutPromise = new Promise<never>((_, reject) => 
+            setTimeout(() => reject(new Error("Gemini API Timeout")), 20000)
+        );
+
+        const result = await Promise.race([
+            model.generateContent([prompt, imagePart]),
+            timeoutPromise
+        ]) as any;
+
         return result.response.text();
     } catch (error: any) {
         if (error.message?.includes('404')) throw error;
 
-        if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded'))) {
+        // Catch timeouts and fetch failures to trigger retries cleanly
+        if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded') || error.message?.includes('Timeout') || error.message?.includes('fetch failed'))) {
+            console.log(`⚠️ Gemini API failed (${error.message}). Retrying in ${delay}ms...`);
             await new Promise(r => setTimeout(r, delay));
             return generateWithRetry(prompt, imagePart, retries - 1, delay * 2);
         }
@@ -251,12 +290,12 @@ async function generateWithRetry(prompt: string, imagePart: any, retries = 3, de
 
 app.get('/api/next-memory', async (req, res) => {
     try {
-        // ASYNC: Check NAS existence
+        // ASYNC: Check NAS existence with Circuit Breaker
         if (NAS_ROOT_PATH) {
-            const nasMounted = await fileExists(NAS_ROOT_PATH);
+            const nasMounted = await checkNasConnection();
             if (!nasMounted) {
                 return res.json({
-                    text: "⚠️ System Alert: Storage not accessible.",
+                    text: "⚠️ System Alert: Storage not accessible. Retrying shortly...",
                     type: 'quote',
                     author: "System Alert",
                     date: new Date().toISOString(),
@@ -279,9 +318,13 @@ app.get('/api/next-memory', async (req, res) => {
         // ASYNC: Check if chosen photo still exists
         const photoExists = await fileExists(selectedPhoto.path);
         if (!photoExists) {
-            photoLibrary = photoLibrary.filter(p => p.path !== selectedPhoto!.path);
-            photoPaths.delete(selectedPhoto!.path);
-            return res.status(500).json({ error: "File missing" });
+            // CRITICAL FIX: Only purge the memory if we KNOW the NAS is online (meaning it was actually deleted).
+            if (!isNasOffline) {
+                photoLibrary = photoLibrary.filter(p => p.path !== selectedPhoto!.path);
+                photoPaths.delete(selectedPhoto!.path);
+                isDirtyPhotos = true;
+            }
+            return res.status(500).json({ error: "File missing or NAS unreachable" });
         }
 
         let isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
@@ -307,7 +350,7 @@ app.get('/api/next-memory', async (req, res) => {
         if (!aiResponse || duplicateDetected) {
             
             if (isGeneratingAI) {
-                console.log("⚠️ Backend is busy generating AI text. Forcing a cached fallback memory.");
+                console.log("⚠️ Backend is busy. Forcing a cached fallback memory.");
                 const cachedPaths = Object.keys(textLibrary);
                 const availableCachedPhotos = photoLibrary.filter(p => cachedPaths.includes(p.path));
                 
@@ -350,7 +393,6 @@ app.get('/api/next-memory', async (req, res) => {
                 `;
 
                 try {
-                    // ASYNC image read happens here now!
                     const imagePart = await fileToGenerativePart(selectedPhoto.path, "image/jpeg");
                     const text = await generateWithRetry(prompt, imagePart);
                     
@@ -393,14 +435,12 @@ app.get('/api/image', async (req, res) => {
         return res.end(img);
     }
     
-    // ASYNC: Check if image exists before serving
     const exists = await fileExists(filePath);
     if (!exists) return res.status(404).send('Image not found');
     res.sendFile(filePath);
 });
 
 // --- MANAGEMENT ENDPOINTS ---
-// All updated to use fsPromises
 
 app.post('/api/favorite', async (req, res) => {
     try {
