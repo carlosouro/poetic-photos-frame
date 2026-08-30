@@ -1,3 +1,17 @@
+# Environment & Secrets
 .env
-node_modules
+.env.*
+!.example.env
+
+# Local Context & Documentation
+GEMINI.md
+gemini.md
+.gemini/
+
+# Node & Build
+node_modules/
+dist/
+
+# Local cache & logs
 cache/
+*.log

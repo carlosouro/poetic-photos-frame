@@ -4,7 +4,8 @@ import fs from 'fs';
 import { promises as fsPromises } from 'fs'; // Async File System API
 import path from 'path';
 import dotenv from 'dotenv';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
+import sharp from 'sharp';
 import { exec, fork } from 'child_process';
 
 dotenv.config();
@@ -17,13 +18,8 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // --- CONFIGURATION ---
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 const modelName = process.env.GEMINI_MODEL || "gemini-flash-latest";
-
-const model = genAI.getGenerativeModel({ 
-    model: modelName,
-    apiVersion: 'v1beta' 
-} as any);
 
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH;
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
@@ -197,7 +193,11 @@ function selectSmartPhoto(): Photo | null {
 
 const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
     return new Promise((resolve, reject) => {
-        const indexer = fork('src/indexer.ts', [`--mode=${mode}`]);
+        const isCompiled = __filename.endsWith('.js');
+        const indexerPath = isCompiled
+            ? path.join(__dirname, 'indexer.js')
+            : path.join(__dirname, 'indexer.ts');
+        const indexer = fork(indexerPath, [`--mode=${mode}`]);
 
         indexer.on('message', (msg: any) => {
             if (msg.type === 'batch' && Array.isArray(msg.photos)) {
@@ -243,38 +243,98 @@ const performIndexing = async (clearCache: boolean) => {
         .finally(() => isIndexing = false);
 };
 
+// --- LOG MAINTENANCE ---
+const trimLogFile = async (maxLines = 10000) => {
+    const logPath = path.resolve('frame.log');
+    try {
+        if (await fileExists(logPath)) {
+            const data = await fsPromises.readFile(logPath, 'utf-8');
+            const lines = data.split('\n');
+            if (lines.length > maxLines + 500) {
+                const trimmed = lines.slice(-maxLines).join('\n');
+                await fsPromises.writeFile(logPath, trimmed, 'utf-8');
+                console.log(`🧹 Log trimmed to last ${maxLines} lines.`);
+            }
+        }
+    } catch (err) {
+        console.error("Log trimming error:", err);
+    }
+};
+
 // --- SCHEDULING ---
 setInterval(() => savePhotosToDisk(), 30 * 1000);
 setInterval(() => {
     const now = new Date();
-    if (now.getHours() === 2 && now.getMinutes() === 0) performIndexing(false); 
+    if (now.getHours() === 2 && now.getMinutes() === 0) {
+        performIndexing(false); 
+        trimLogFile(10000);
+    }
 }, 60 * 1000);
 
 // --- API LOGIC ---
 
-async function fileToGenerativePart(filePath: string, mimeType: string) {
-    const data = await fsPromises.readFile(filePath);
-    return {
-        inlineData: {
+async function fileToGenerativePart(filePath: string, mimeType = "image/jpeg") {
+    try {
+        // Downscale image to max 1024x1024 to drop base64 payload from 15MB+ to ~150KB
+        const resizedBuffer = await sharp(filePath)
+            .rotate() // preserve EXIF orientation
+            .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
+            .jpeg({ quality: 80 })
+            .toBuffer();
+
+        return {
+            data: resizedBuffer.toString("base64"),
+            mimeType: "image/jpeg"
+        };
+    } catch (sharpError) {
+        console.warn(`⚠️ Sharp resizing failed for ${path.basename(filePath)}, using raw file fallback:`, sharpError);
+        const data = await fsPromises.readFile(filePath);
+        return {
             data: data.toString("base64"),
             mimeType
-        },
-    };
+        };
+    }
 }
 
-async function generateWithRetry(prompt: string, imagePart: any, retries = 3, delay = 1000): Promise<string> {
+async function generateWithRetry(prompt: string, imagePart: { data: string; mimeType: string }, retries = 3, delay = 1000): Promise<TextEntry> {
     try {
         // Enforce a strict 20-second timeout on Gemini API calls so network drops don't hang the app forever
         const timeoutPromise = new Promise<never>((_, reject) => 
             setTimeout(() => reject(new Error("Gemini API Timeout")), 20000)
         );
 
-        const result = await Promise.race([
-            model.generateContent([prompt, imagePart]),
-            timeoutPromise
-        ]) as any;
+        const apiCall = ai.models.generateContent({
+            model: modelName,
+            contents: [
+                { text: prompt },
+                {
+                    inlineData: {
+                        mimeType: imagePart.mimeType,
+                        data: imagePart.data
+                    }
+                }
+            ],
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: 'OBJECT',
+                    properties: {
+                        content: { type: 'STRING', description: 'A short 2-4 line poem or profound quote matching the photo' },
+                        type: { type: 'STRING', enum: ['quote', 'poem'], description: 'Whether the text is a quote or a poem' },
+                        author: { type: 'STRING', nullable: true, description: 'Author name if quote, null if poem' }
+                    },
+                    required: ['content', 'type']
+                }
+            } as any
+        });
 
-        return result.response.text();
+        const result = await Promise.race([apiCall, timeoutPromise]) as any;
+        const text = typeof result.text === 'function'
+            ? result.text()
+            : (typeof result.text === 'string' ? result.text : (result.candidates?.[0]?.content?.parts?.[0]?.text || ''));
+        const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        const parsed = JSON.parse(cleanText) as TextEntry;
+        return parsed;
     } catch (error: any) {
         if (error.message?.includes('404')) throw error;
 
@@ -372,11 +432,19 @@ app.get('/api/next-memory', async (req, res) => {
                     exclusionInstruction = `IMPORTANT: The following text was already used. Do NOT use it again: "${textToExclude}". Find something different.`;
                 }
 
+                const photoDate = new Date(selectedPhoto.created);
+                const now = new Date();
+                const yearsAgo = now.getFullYear() - photoDate.getFullYear();
+                let temporalContext = "";
+                if (yearsAgo > 0 && Math.abs(now.getMonth() - photoDate.getMonth()) <= 1) {
+                    temporalContext = `Context: This memory is an anniversary memory from ${yearsAgo} ${yearsAgo === 1 ? 'year' : 'years'} ago (${photoDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}).`;
+                }
+
                 const prompt = `
                     You are a poetic assistant for a digital photo frame. Look at this image.
                     
-                    Goal: Generate text that matches the mood, location, or emotion of the photo.
-                    
+                    Goal: Generate text that matches the mood, location, and emotional resonance of the photo.
+                    ${temporalContext ? `${temporalContext}\n` : ''}
                     Preference: I am leaning towards a **${preferredType.toUpperCase()}** for this specific image. 
                     However, please override this preference if the image content clearly suits the other format much better.
                     
@@ -387,19 +455,13 @@ app.get('/api/next-memory', async (req, res) => {
                     - Poem: A short, beautiful poem (max 4 lines).
                     
                     Language: Randomly choose between Portuguese (European - PT-PT) or English.
-                    
-                    Output Format: JSON only.
-                    Structure: { "content": "The text", "type": "quote" OR "poem", "author": "Author Name (if quote) or null (if poem)" }
                 `;
 
                 try {
                     const imagePart = await fileToGenerativePart(selectedPhoto.path, "image/jpeg");
-                    const text = await generateWithRetry(prompt, imagePart);
+                    aiResponse = await generateWithRetry(prompt, imagePart);
                     
-                    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-                    aiResponse = JSON.parse(cleanText);
-                    
-                    textLibrary[selectedPhoto.path] = aiResponse!;
+                    textLibrary[selectedPhoto.path] = aiResponse;
                     saveTextsToDisk(); 
                 } catch (aiError) {
                     console.error("Gemini Final Error:", aiError);
