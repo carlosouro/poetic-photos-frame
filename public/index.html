@@ -271,12 +271,15 @@
 
         // Video playback event listeners
         videoEl.addEventListener('ended', () => {
+            if (!currentMemory || !currentMemory.isVideo) return;
             if (displayTimer) clearTimeout(displayTimer);
             console.log("🎬 Video finished playing, advancing to next memory.");
             updateDisplay(false);
         });
 
         videoEl.addEventListener('error', (e) => {
+            if (!currentMemory || !currentMemory.isVideo) return;
+            if (!videoEl.currentSrc && !videoEl.src) return;
             console.warn("⚠️ Video playback error, advancing to next memory:", e);
             if (displayTimer) clearTimeout(displayTimer);
             displayTimer = setTimeout(() => updateDisplay(false), 1500);
@@ -407,7 +410,7 @@
             }
         }
 
-        async function updateDisplay(useHistory = false) {
+        async function updateDisplay(useHistory = false, isUserTap = false) {
             if (isProcessing) return;
 
             try {
@@ -426,11 +429,12 @@
                     if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                     
                     try {
-                        // If we already have a memory on screen and buffered candidates, wait at most 2.5s for fresh fetch
-                        if (currentMemory && memoryBuffer.length > 0) {
+                        const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
+                        // On manual user tap, if we have other buffered memories, wait at most 1.5s for fresh fetch before showing a buffered memory
+                        if (isUserTap && candidates.length > 0) {
                             memory = await Promise.race([
                                 nextMemoryPromise,
-                                new Promise(resolve => setTimeout(() => resolve(null), 2500))
+                                new Promise(resolve => setTimeout(() => resolve(null), 1500))
                             ]);
                         } else {
                             memory = await nextMemoryPromise;
@@ -439,26 +443,26 @@
                         console.warn("Awaiting memory promise failed:", e);
                         memory = null;
                     }
-                    nextMemoryPromise = null;
+                    if (memory) {
+                        nextMemoryPromise = null;
+                    }
                 }
 
-                // If fetch returned null (e.g. temporary network drop or race timeout)
-                if (!memory) {
-                    // Fallback to buffered memories
-                    if (memoryBuffer.length > 0) {
-                        const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
-                        memory = candidates.length > 0 
-                            ? candidates[Math.floor(Math.random() * candidates.length)]
-                            : memoryBuffer[0];
+                // If fetch returned null (e.g. temporary network drop or user tap race timeout)
+                if (!memory && memoryBuffer.length > 0) {
+                    const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
+                    if (candidates.length > 0) {
+                        memory = candidates[Math.floor(Math.random() * candidates.length)];
                         console.log("ℹ️ Seamless fallback to buffered memory:", memory.imagePathEncoded);
                     }
                 }
 
-                // If still no memory (cold startup before first photo loaded)
-                if (!memory) {
+                // If still no memory, or if it resolves to the exact same memory currently displayed:
+                // Keep current memory peacefully on screen and retry in 2 seconds. NEVER flash the screen!
+                if (!memory || (currentMemory && memory.imagePathEncoded === currentMemory.imagePathEncoded)) {
                     if (!currentMemory) showLoader("Waiting for memories...");
                     if (displayTimer) clearTimeout(displayTimer);
-                    displayTimer = setTimeout(() => updateDisplay(false), 3000);
+                    displayTimer = setTimeout(() => updateDisplay(false), 2000);
                     return;
                 }
 
@@ -505,11 +509,13 @@
                     dateEl.style.opacity = 1;
 
                     if (displayTimer) clearTimeout(displayTimer);
-                    displayTimer = setTimeout(updateDisplay, currentInterval);
+                    displayTimer = setTimeout(() => updateDisplay(false), currentInterval);
                 }
 
                 // Start preloading the next memory quietly in the background
-                nextMemoryPromise = fetchNextMemory();
+                if (!nextMemoryPromise) {
+                    nextMemoryPromise = fetchNextMemory();
+                }
 
             } catch (error) {
                 console.error("Display update unexpected error:", error);
@@ -525,7 +531,7 @@
         document.getElementById('zone-left').addEventListener('click', () => {
             if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
             if (historyStack.length === 0) return; 
-            updateDisplay(true); 
+            updateDisplay(true, true); 
         });
 
         document.getElementById('zone-center').addEventListener('click', () => {
@@ -538,7 +544,7 @@
 
         document.getElementById('zone-right').addEventListener('click', () => {
             if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
-            updateDisplay(false); 
+            updateDisplay(false, true); 
         });
 
         menuOverlay.addEventListener('click', (e) => { 
