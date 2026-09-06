@@ -587,7 +587,7 @@ const handleMediaServing = async (req: express.Request, res: express.Response) =
 
     const mimeTypes: Record<string, string> = {
         '.mp4': 'video/mp4',
-        '.mov': 'video/quicktime',
+        '.mov': 'video/mp4', // ISO-BMFF container supported natively by Chromium HTML5 media player
         '.m4v': 'video/mp4',
         '.webm': 'video/webm',
         '.jpg': 'image/jpeg',

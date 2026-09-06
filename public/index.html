@@ -426,7 +426,7 @@
                 photoEl.src = '';
                 videoEl.style.display = 'block';
                 videoEl.src = memory.mediaSrc || `/api/media?path=${memory.imagePathEncoded}`;
-                videoEl.currentTime = 0;
+                videoEl.load();
                 videoEl.muted = true;
 
                 poemEl.innerText = "";
@@ -439,7 +439,8 @@
             } else {
                 videoIndicatorEl.classList.remove('visible');
                 try { videoEl.pause(); } catch(e) {}
-                videoEl.src = '';
+                videoEl.removeAttribute('src');
+                videoEl.load();
                 videoEl.style.display = 'none';
                 photoEl.style.display = 'block';
                 photoEl.src = memory.imageSrc || `/api/image?path=${memory.imagePathEncoded}`;
@@ -741,7 +742,8 @@
                     deletePreviewVideo.src = currentMemory.mediaSrc || `/api/media?path=${currentMemory.imagePathEncoded}`;
                 } else {
                     deletePreviewVideo.style.display = 'none';
-                    deletePreviewVideo.src = '';
+                    deletePreviewVideo.removeAttribute('src');
+                    deletePreviewVideo.load();
                     deletePreviewEl.style.display = 'block';
                     deletePreviewEl.src = currentMemory.imageSrc || `/api/image?path=${currentMemory.imagePathEncoded}`;
                 }
@@ -751,7 +753,8 @@
             cancelDelete: () => {
                 deleteOverlay.classList.remove('overlay-visible');
                 try { deletePreviewVideo.pause(); } catch(e) {}
-                deletePreviewVideo.src = '';
+                deletePreviewVideo.removeAttribute('src');
+                deletePreviewVideo.load();
                 if (currentMemory && currentMemory.isVideo) {
                     videoEl.play().catch(e => {});
                 }
