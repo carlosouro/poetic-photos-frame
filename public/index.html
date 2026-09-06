@@ -409,7 +409,6 @@
 
         async function updateDisplay(useHistory = false) {
             if (isProcessing) return;
-            isProcessing = true; 
 
             try {
                 if (displayTimer) clearTimeout(displayTimer);
@@ -427,7 +426,15 @@
                     if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                     
                     try {
-                        memory = await nextMemoryPromise;
+                        // If we already have a memory on screen and buffered candidates, wait at most 2.5s for fresh fetch
+                        if (currentMemory && memoryBuffer.length > 0) {
+                            memory = await Promise.race([
+                                nextMemoryPromise,
+                                new Promise(resolve => setTimeout(() => resolve(null), 2500))
+                            ]);
+                        } else {
+                            memory = await nextMemoryPromise;
+                        }
                     } catch (e) {
                         console.warn("Awaiting memory promise failed:", e);
                         memory = null;
@@ -435,7 +442,7 @@
                     nextMemoryPromise = null;
                 }
 
-                // If fetch returned null (e.g. temporary network drop)
+                // If fetch returned null (e.g. temporary network drop or race timeout)
                 if (!memory) {
                     // Fallback to buffered memories
                     if (memoryBuffer.length > 0) {
@@ -454,6 +461,9 @@
                     displayTimer = setTimeout(() => updateDisplay(false), 3000);
                     return;
                 }
+
+                // Lock ONLY during the actual visual fade and switch
+                isProcessing = true;
 
                 if (currentMemory && memory.imagePathEncoded !== currentMemory.imagePathEncoded) {
                     historyStack.push(currentMemory);
@@ -519,7 +529,6 @@
         });
 
         document.getElementById('zone-center').addEventListener('click', () => {
-            if (isProcessing) return;
             if (displayTimer) clearTimeout(displayTimer); 
             if (currentMemory && currentMemory.isVideo) {
                 try { videoEl.pause(); } catch(e) {}

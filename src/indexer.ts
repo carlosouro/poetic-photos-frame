@@ -1,8 +1,21 @@
-import fs from 'fs';
+import fs, { promises as fsPromises } from 'fs';
 import path from 'path';
+import os from 'os';
+import { exec } from 'child_process';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+// Apply lowest CPU and I/O scheduling priority to keep photo slideshow completely fluid
+try {
+    os.setPriority(os.constants.priority.PRIORITY_LOW);
+} catch (e) {}
+
+if (process.platform === 'linux') {
+    try {
+        exec(`ionice -c 3 -p ${process.pid}`, () => {});
+    } catch (e) {}
+}
 
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH || './test-photos'; 
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
@@ -15,6 +28,8 @@ const MAX_IMAGE_SIZE_MB = parseInt(process.env.MAX_IMAGE_SIZE_MB || '25', 10);
 const MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024;
 const MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024;
 const BATCH_SIZE = 50; 
+const THROTTLE_DIR_MS = 15;   // Cooperative yield after scanning each directory
+const THROTTLE_BATCH_MS = 25; // Cooperative yield after dispatching each batch
 
 interface Photo {
     path: string;
@@ -34,7 +49,6 @@ let totalFiles = 0;
 
 function sendBatch(photos: Photo[], cb?: () => void) {
     if (hasIPC) {
-        // FIXED: Cast process to 'any' to bypass TypeScript overload confusion.
         (process as any).send({ type: 'batch', photos: photos }, (err: any) => {
             if (cb) cb();
         });
@@ -43,8 +57,12 @@ function sendBatch(photos: Photo[], cb?: () => void) {
     }
 }
 
-function scanDirectory(dir: string, batchBuffer: Photo[]) {
-    if (!fs.existsSync(dir)) return;
+async function scanDirectory(dir: string, batchBuffer: Photo[]) {
+    try {
+        await fsPromises.access(dir);
+    } catch {
+        return;
+    }
 
     totalDirs++;
     // Log progress every 100 directories
@@ -52,7 +70,8 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
 
     try {
         // Sort reverse to prioritize newer folders
-        const files = fs.readdirSync(dir).sort().reverse();
+        const rawEntries = await fsPromises.readdir(dir);
+        const files = rawEntries.sort().reverse();
 
         for (const file of files) {
             // Skip hidden files, Synology thumbnails (@eaDir), OR the OMITTED folder
@@ -63,14 +82,16 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
 
             try {
                 // Use lstat to check for symlinks first to avoid loops
-                const lstat = fs.lstatSync(filePath);
+                const lstat = await fsPromises.lstat(filePath);
                 if (lstat.isSymbolicLink()) continue; 
                 
-                stat = fs.statSync(filePath);
+                stat = await fsPromises.stat(filePath);
             } catch (e) { continue; }
 
             if (stat.isDirectory()) {
-                scanDirectory(filePath, batchBuffer);
+                await scanDirectory(filePath, batchBuffer);
+                // Cooperative yield to keep CIFS socket free for slideshow streaming
+                await new Promise(r => setTimeout(r, THROTTLE_DIR_MS));
             } else {
                 if (stat.size <= 0) continue;
                 const ext = path.extname(file).toLowerCase();
@@ -89,8 +110,11 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
                     });
 
                     if (batchBuffer.length >= BATCH_SIZE) {
-                        sendBatch([...batchBuffer]);
+                        await new Promise<void>(resolve => {
+                            sendBatch([...batchBuffer], () => resolve());
+                        });
                         batchBuffer.length = 0; 
+                        await new Promise(r => setTimeout(r, THROTTLE_BATCH_MS));
                     }
                 }
             }
@@ -109,22 +133,23 @@ if (isDefaultsMode) {
     targetPath = path.join(NAS_ROOT_PATH, DEFAULTS_FOLDER_NAME);
 }
 
-console.log(`📷 Indexer started. Scanning: ${targetPath}`);
-scanDirectory(targetPath, batchBuffer);
+(async () => {
+    console.log(`📷 Indexer started (Nice=19, Ionice=Idle). Scanning: ${targetPath}`);
+    await scanDirectory(targetPath, batchBuffer);
 
-console.log(`\n✅ Scan complete. Found ${totalFiles} files in ${totalDirs} directories.`);
-console.log(`🚚 Flushing final data...`);
+    console.log(`\n✅ Scan complete. Found ${totalFiles} files in ${totalDirs} directories.`);
+    console.log(`🚚 Flushing final data...`);
 
-// Send remaining items and WAIT for callback before exiting
-if (batchBuffer.length > 0) {
-    sendBatch(batchBuffer, () => {
-        console.log("👋 Final batch sent. Exiting.");
-        process.exit(0);
-    });
-} else {
-    // If empty, just exit (but give a small tick for any previous sends to clear)
-    setTimeout(() => {
-        console.log("👋 Exiting.");
-        process.exit(0);
-    }, 1000);
-}
+    // Send remaining items and WAIT for callback before exiting
+    if (batchBuffer.length > 0) {
+        sendBatch(batchBuffer, () => {
+            console.log("👋 Final batch sent. Exiting.");
+            process.exit(0);
+        });
+    } else {
+        setTimeout(() => {
+            console.log("👋 Exiting.");
+            process.exit(0);
+        }, 500);
+    }
+})();
