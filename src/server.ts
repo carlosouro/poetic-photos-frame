@@ -41,7 +41,14 @@ if (!fs.existsSync(CACHE_DIR)) {
 interface Photo {
     path: string;
     created: string;
+    mediaType?: 'image' | 'video';
 }
+
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
+const isVideoFile = (filePath: string): boolean => {
+    const ext = path.extname(filePath).toLowerCase();
+    return VIDEO_EXTENSIONS.has(ext);
+};
 
 interface TextEntry {
     content: string;
@@ -387,7 +394,23 @@ app.get('/api/next-memory', async (req, res) => {
             return res.status(500).json({ error: "File missing or NAS unreachable" });
         }
 
-        let isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
+        const isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
+        const isVideo = selectedPhoto.mediaType === 'video' || isVideoFile(selectedPhoto.path);
+
+        // If it's a video, bypass Gemini AI generation completely
+        if (isVideo) {
+            return res.json({
+                text: "",
+                type: 'video',
+                author: null,
+                date: selectedPhoto.created,
+                imagePathEncoded: encodeURIComponent(selectedPhoto.path),
+                mediaUrl: `/api/media?path=${encodeURIComponent(selectedPhoto.path)}`,
+                isVideo: true,
+                isFavorite: isFavorite
+            });
+        }
+
         let aiResponse: TextEntry | null = null;
         let duplicateDetected = false;
         let textToExclude = "";
@@ -417,7 +440,6 @@ app.get('/api/next-memory', async (req, res) => {
                 if (availableCachedPhotos.length > 0) {
                     selectedPhoto = availableCachedPhotos[Math.floor(Math.random() * availableCachedPhotos.length)];
                     aiResponse = textLibrary[selectedPhoto.path];
-                    isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
                 } else {
                     aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
                 }
@@ -480,7 +502,9 @@ app.get('/api/next-memory', async (req, res) => {
             author: aiResponse!.author,
             date: selectedPhoto.created,
             imagePathEncoded: encodeURIComponent(selectedPhoto.path),
-            isFavorite: isFavorite 
+            mediaUrl: `/api/image?path=${encodeURIComponent(selectedPhoto.path)}`,
+            isVideo: false,
+            isFavorite: selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME)
         });
 
     } catch (error) {
@@ -489,7 +513,7 @@ app.get('/api/next-memory', async (req, res) => {
     }
 });
 
-app.get('/api/image', async (req, res) => {
+const handleMediaServing = async (req: express.Request, res: express.Response) => {
     const filePath = decodeURIComponent(req.query.path as string);
     if (filePath === ERROR_IMAGE_MARKER) {
         const img = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+P+/HgAFhAJ/wlseKgAAAABJRU5ErkJggg==", 'base64');
@@ -498,9 +522,32 @@ app.get('/api/image', async (req, res) => {
     }
     
     const exists = await fileExists(filePath);
-    if (!exists) return res.status(404).send('Image not found');
-    res.sendFile(filePath);
-});
+    if (!exists) return res.status(404).send('Media not found');
+
+    const ext = path.extname(filePath).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+        '.mp4': 'video/mp4',
+        '.mov': 'video/quicktime',
+        '.m4v': 'video/mp4',
+        '.webm': 'video/webm',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.webp': 'image/webp'
+    };
+    const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+    res.sendFile(path.resolve(filePath), {
+        acceptRanges: true,
+        headers: {
+            'Content-Type': contentType,
+            'Accept-Ranges': 'bytes'
+        }
+    });
+};
+
+app.get('/api/image', handleMediaServing);
+app.get('/api/media', handleMediaServing);
 
 // --- MANAGEMENT ENDPOINTS ---
 

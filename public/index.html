@@ -25,7 +25,7 @@
             width: 100%; height: 100%; display: flex;
             justify-content: center; align-items: center; background: #000;
         }
-        #main-photo {
+        #main-photo, #main-video {
             max-width: 100%; max-height: 100%; object-fit: contain; 
             opacity: 0; transition: opacity 1.5s ease-in-out;
         }
@@ -148,6 +148,7 @@
         
         <div id="photo-container">
             <img id="main-photo" src="" alt="Memory">
+            <video id="main-video" playsinline muted style="display: none;"></video>
         </div>
 
         <div id="text-overlay">
@@ -196,9 +197,10 @@
 
         <div id="delete-confirm-overlay">
             <div id="menu-box">
-                <div class="menu-title" style="color:#c0392b">Delete Photo?</div>
+                <div class="menu-title" style="color:#c0392b">Delete Memory?</div>
                 <div class="delete-msg">This cannot be undone.</div>
                 <img id="delete-preview-img" src="" />
+                <video id="delete-preview-video" playsinline muted style="display:none; max-width: 100%; max-height: 150px; border-radius: 8px; margin: 10px 0;"></video>
                 
                 <button class="btn btn-danger" onclick="menuActions.doDelete()">Confirm Delete</button>
                 <button class="btn btn-cancel" onclick="menuActions.cancelDelete()">Cancel</button>
@@ -215,11 +217,10 @@
         
         let currentMemory = null; 
         let historyStack = []; 
-        const HISTORY_LIMIT = 25;
-        
         let isProcessing = false;
 
         const photoEl = document.getElementById('main-photo');
+        const videoEl = document.getElementById('main-video');
         const poemEl = document.getElementById('poem-text');
         const authorEl = document.getElementById('author-text');
         const dateEl = document.getElementById('date-display');
@@ -231,6 +232,7 @@
         const menuOverlay = document.getElementById('menu-overlay');
         const deleteOverlay = document.getElementById('delete-confirm-overlay');
         const deletePreviewEl = document.getElementById('delete-preview-img');
+        const deletePreviewVideo = document.getElementById('delete-preview-video');
         const sliderEl = document.getElementById('interval-slider');
         const intervalDisplayEl = document.getElementById('interval-display');
 
@@ -261,8 +263,21 @@
         // Initial state: hide cursor by default
         document.body.classList.add('hide-cursor');
 
+        // Video playback event listeners
+        videoEl.addEventListener('ended', () => {
+            if (displayTimer) clearTimeout(displayTimer);
+            console.log("🎬 Video finished playing, advancing to next memory.");
+            updateDisplay(false);
+        });
+
+        videoEl.addEventListener('error', (e) => {
+            console.warn("⚠️ Video playback error, advancing to next memory:", e);
+            if (displayTimer) clearTimeout(displayTimer);
+            displayTimer = setTimeout(() => updateDisplay(false), 1500);
+        });
+
         async function fetchNextMemory() {
-            // ADJUSTED TIMEOUT: 25s is a sweet spot for AI generation
+            // 25s timeout limit for fetching memory metadata
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 25000);
 
@@ -273,13 +288,54 @@
                 if (!response.ok) throw new Error(`Server Error: ${response.status}`);
                 const data = await response.json();
 
-                return new Promise((resolve, reject) => {
-                    const img = new Image();
-                    img.src = `/api/image?path=${data.imagePathEncoded}`;
-                    img.onload = () => resolve({ ...data, imageSrc: img.src });
-                    img.onerror = () => reject("Image load failed");
-                    setTimeout(() => reject("Image load timed out"), 25000);
-                });
+                if (data.isVideo) {
+                    return new Promise((resolve) => {
+                        const vid = document.createElement('video');
+                        vid.preload = 'auto';
+                        vid.muted = true;
+                        vid.src = data.mediaUrl || `/api/media?path=${data.imagePathEncoded}`;
+                        
+                        let resolved = false;
+                        const onLoaded = () => {
+                            if (!resolved) {
+                                resolved = true;
+                                cleanup();
+                                resolve({ ...data, mediaSrc: vid.src, isVideo: true });
+                            }
+                        };
+                        const onError = () => {
+                            if (!resolved) {
+                                resolved = true;
+                                cleanup();
+                                resolve({ ...data, mediaSrc: vid.src, isVideo: true });
+                            }
+                        };
+                        const timeout = setTimeout(() => {
+                            if (!resolved) {
+                                resolved = true;
+                                cleanup();
+                                resolve({ ...data, mediaSrc: vid.src, isVideo: true });
+                            }
+                        }, 12000);
+                        const cleanup = () => {
+                            clearTimeout(timeout);
+                            vid.removeEventListener('loadeddata', onLoaded);
+                            vid.removeEventListener('canplay', onLoaded);
+                            vid.removeEventListener('error', onError);
+                        };
+                        vid.addEventListener('loadeddata', onLoaded);
+                        vid.addEventListener('canplay', onLoaded);
+                        vid.addEventListener('error', onError);
+                    });
+                } else {
+                    return new Promise((resolve, reject) => {
+                        const img = new Image();
+                        img.src = data.mediaUrl || `/api/image?path=${data.imagePathEncoded}`;
+                        img.onload = () => resolve({ ...data, imageSrc: img.src, isVideo: false });
+                        img.onerror = () => reject(new Error("Image load failed"));
+                        setTimeout(() => reject(new Error("Image load timed out")), 25000);
+                    });
+                }
             } catch (error) {
                 console.error("Fetch failed:", error);
                 throw error;
@@ -287,25 +343,44 @@
         }
 
         function renderMemory(memory) {
-            photoEl.src = memory.imageSrc;
-            poemEl.innerText = `"${memory.text}"`;
+            if (memory.isVideo) {
+                photoEl.style.display = 'none';
+                photoEl.src = '';
+                videoEl.style.display = 'block';
+                videoEl.src = memory.mediaSrc || `/api/media?path=${memory.imagePathEncoded}`;
+                videoEl.currentTime = 0;
+                videoEl.muted = true;
+
+                poemEl.innerText = "";
+                poemEl.style.display = 'none';
+                authorEl.style.display = 'none';
+            } else {
+                try { videoEl.pause(); } catch(e) {}
+                videoEl.src = '';
+                videoEl.style.display = 'none';
+                photoEl.style.display = 'block';
+                photoEl.src = memory.imageSrc || `/api/image?path=${memory.imagePathEncoded}`;
+
+                poemEl.innerText = `"${memory.text}"`;
+                poemEl.style.display = 'block';
+                
+                if (memory.type === 'quote' && memory.author) {
+                    authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
+                    authorEl.style.display = 'block';
+                    
+                    if (memory.author === 'System Alert') {
+                        poemEl.style.color = '#ff6b6b'; authorEl.style.color = '#ff6b6b';
+                    } else {
+                        poemEl.style.color = '#f0f0f0'; authorEl.style.color = '#aaa';  
+                    }
+                } else {
+                    authorEl.style.display = 'none';
+                    poemEl.style.color = '#f0f0f0';
+                }
+            }
             
             if (memory.isFavorite) quickFavBtn.classList.add('active');
             else quickFavBtn.classList.remove('active');
-
-            if (memory.type === 'quote' && memory.author) {
-                authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
-                authorEl.style.display = 'block';
-                
-                if (memory.author === 'System Alert') {
-                    poemEl.style.color = '#ff6b6b'; authorEl.style.color = '#ff6b6b';
-                } else {
-                    poemEl.style.color = '#f0f0f0'; authorEl.style.color = '#aaa';  
-                }
-            } else {
-                authorEl.style.display = 'none';
-                poemEl.style.color = '#f0f0f0';
-            }
 
             const dateObj = new Date(memory.date);
             if (dateObj.getFullYear() > 1980) {
@@ -344,6 +419,7 @@
                 currentMemory = memory;
 
                 photoEl.style.opacity = 0;
+                videoEl.style.opacity = 0;
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
@@ -353,19 +429,37 @@
                 renderMemory(memory);
                 hideLoader();
 
-                photoEl.style.opacity = 1;
-                poemEl.style.opacity = 1;
-                if (memory.type === 'quote') authorEl.style.opacity = 1;
-                dateEl.style.opacity = 1;
+                if (memory.isVideo) {
+                    videoEl.style.opacity = 1;
+                    dateEl.style.opacity = 1;
+
+                    videoEl.play().catch(err => {
+                        console.warn("Video play error:", err);
+                        displayTimer = setTimeout(() => updateDisplay(false), 2000);
+                    });
+
+                    // 60-second safety cap for long video clips
+                    if (displayTimer) clearTimeout(displayTimer);
+                    displayTimer = setTimeout(() => {
+                        console.log("Video 60s max safety cap reached, advancing...");
+                        updateDisplay(false);
+                    }, 60000);
+                } else {
+                    photoEl.style.opacity = 1;
+                    poemEl.style.opacity = 1;
+                    if (memory.type === 'quote') authorEl.style.opacity = 1;
+                    dateEl.style.opacity = 1;
+
+                    if (displayTimer) clearTimeout(displayTimer);
+                    displayTimer = setTimeout(updateDisplay, currentInterval);
+                }
 
                 nextMemoryPromise = fetchNextMemory().catch(e => console.warn("Background fetch failed"));
-                displayTimer = setTimeout(updateDisplay, currentInterval);
 
             } catch (error) {
                 console.error("Display update failed:", error);
                 showLoader("Retrying Connection...");
                 nextMemoryPromise = null;
-                // INCREASED FALLBACK TIMEOUT: Give network/backend 10s to breathe if it failed
                 displayTimer = setTimeout(updateDisplay, 10000); 
             } finally {
                 isProcessing = false;
@@ -381,6 +475,9 @@
         document.getElementById('zone-center').addEventListener('click', () => {
             if (isProcessing) return;
             if (displayTimer) clearTimeout(displayTimer); 
+            if (currentMemory && currentMemory.isVideo) {
+                try { videoEl.pause(); } catch(e) {}
+            }
             menuOverlay.classList.add('overlay-visible');
         });
 
@@ -410,7 +507,14 @@
             close: () => {
                 menuOverlay.classList.remove('overlay-visible');
                 if (displayTimer) clearTimeout(displayTimer);
-                displayTimer = setTimeout(updateDisplay, currentInterval);
+                if (currentMemory && currentMemory.isVideo) {
+                    videoEl.play().catch(e => {});
+                    displayTimer = setTimeout(() => {
+                        updateDisplay(false);
+                    }, 60000);
+                } else {
+                    displayTimer = setTimeout(updateDisplay, currentInterval);
+                }
             },
             
             favorite: async () => {
@@ -470,7 +574,7 @@
                         isProcessing = false;
                         alert("Failed: " + err.error);
                     }
-                } catch(e) {
+                } catch(e) { 
                     hideLoader();
                     isProcessing = false;
                     alert("Error omitting.");
@@ -480,12 +584,26 @@
             confirmDelete: () => {
                 if (!currentMemory) return;
                 menuOverlay.classList.remove('overlay-visible'); 
-                deletePreviewEl.src = currentMemory.imageSrc;
+                if (currentMemory.isVideo) {
+                    deletePreviewEl.style.display = 'none';
+                    deletePreviewVideo.style.display = 'block';
+                    deletePreviewVideo.src = currentMemory.mediaSrc || `/api/media?path=${currentMemory.imagePathEncoded}`;
+                } else {
+                    deletePreviewVideo.style.display = 'none';
+                    deletePreviewVideo.src = '';
+                    deletePreviewEl.style.display = 'block';
+                    deletePreviewEl.src = currentMemory.imageSrc || `/api/image?path=${currentMemory.imagePathEncoded}`;
+                }
                 deleteOverlay.classList.add('overlay-visible');
             },
 
             cancelDelete: () => {
                 deleteOverlay.classList.remove('overlay-visible');
+                try { deletePreviewVideo.pause(); } catch(e) {}
+                deletePreviewVideo.src = '';
+                if (currentMemory && currentMemory.isVideo) {
+                    videoEl.play().catch(e => {});
+                }
                 displayTimer = setTimeout(updateDisplay, currentInterval);
             },
 

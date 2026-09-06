@@ -7,12 +7,15 @@ dotenv.config();
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH || './test-photos'; 
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
 const OMITTED_FOLDER_NAME = '_photoframe_omitted';
-const EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
+const ALL_MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
 const BATCH_SIZE = 50; 
 
 interface Photo {
     path: string;
     created: string;
+    mediaType?: 'image' | 'video';
 }
 
 const args = process.argv.slice(2);
@@ -66,11 +69,13 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
                 scanDirectory(filePath, batchBuffer);
             } else {
                 const ext = path.extname(file).toLowerCase();
-                if (EXTENSIONS.has(ext)) {
+                if (ALL_MEDIA_EXTENSIONS.has(ext)) {
                     totalFiles++;
+                    const isVideo = VIDEO_EXTENSIONS.has(ext);
                     batchBuffer.push({
                         path: filePath,
-                        created: stat.mtime.toISOString()
+                        created: stat.mtime.toISOString(),
+                        mediaType: isVideo ? 'video' : 'image'
                     });
 
                     if (batchBuffer.length >= BATCH_SIZE) {
