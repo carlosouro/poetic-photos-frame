@@ -291,7 +291,7 @@
                 if (data.isVideo) {
                     return new Promise((resolve) => {
                         const vid = document.createElement('video');
-                        vid.preload = 'auto';
+                        vid.preload = 'metadata';
                         vid.muted = true;
                         vid.src = data.mediaUrl || `/api/media?path=${data.imagePathEncoded}`;
                         
@@ -316,14 +316,16 @@
                                 cleanup();
                                 resolve({ ...data, mediaSrc: vid.src, isVideo: true });
                             }
-                        }, 12000);
+                        }, 8000);
                         const cleanup = () => {
                             clearTimeout(timeout);
                             vid.removeEventListener('loadeddata', onLoaded);
+                            vid.removeEventListener('loadedmetadata', onLoaded);
                             vid.removeEventListener('canplay', onLoaded);
                             vid.removeEventListener('error', onError);
                         };
                         vid.addEventListener('loadeddata', onLoaded);
+                        vid.addEventListener('loadedmetadata', onLoaded);
                         vid.addEventListener('canplay', onLoaded);
                         vid.addEventListener('error', onError);
                     });
@@ -333,7 +335,7 @@
                         img.src = data.mediaUrl || `/api/image?path=${data.imagePathEncoded}`;
                         img.onload = () => resolve({ ...data, imageSrc: img.src, isVideo: false });
                         img.onerror = () => reject(new Error("Image load failed"));
-                        setTimeout(() => reject(new Error("Image load timed out")), 25000);
+                        setTimeout(() => reject(new Error("Image load timed out")), 20000);
                     });
                 }
             } catch (error) {
@@ -460,7 +462,8 @@
                 console.error("Display update failed:", error);
                 showLoader("Retrying Connection...");
                 nextMemoryPromise = null;
-                displayTimer = setTimeout(updateDisplay, 10000); 
+                if (displayTimer) clearTimeout(displayTimer);
+                displayTimer = setTimeout(() => updateDisplay(false), 3000); 
             } finally {
                 isProcessing = false;
             }

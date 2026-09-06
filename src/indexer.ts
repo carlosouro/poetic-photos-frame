@@ -10,6 +10,10 @@ const OMITTED_FOLDER_NAME = '_photoframe_omitted';
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
 const ALL_MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
+const MAX_VIDEO_SIZE_MB = parseInt(process.env.MAX_VIDEO_SIZE_MB || '50', 10);
+const MAX_IMAGE_SIZE_MB = parseInt(process.env.MAX_IMAGE_SIZE_MB || '25', 10);
+const MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024;
+const MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024;
 const BATCH_SIZE = 50; 
 
 interface Photo {
@@ -68,10 +72,16 @@ function scanDirectory(dir: string, batchBuffer: Photo[]) {
             if (stat.isDirectory()) {
                 scanDirectory(filePath, batchBuffer);
             } else {
+                if (stat.size <= 0) continue;
                 const ext = path.extname(file).toLowerCase();
                 if (ALL_MEDIA_EXTENSIONS.has(ext)) {
-                    totalFiles++;
                     const isVideo = VIDEO_EXTENSIONS.has(ext);
+                    const maxSize = isVideo ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
+                    if (stat.size > maxSize) {
+                        continue;
+                    }
+
+                    totalFiles++;
                     batchBuffer.push({
                         path: filePath,
                         created: stat.mtime.toISOString(),

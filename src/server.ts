@@ -50,6 +50,20 @@ const isVideoFile = (filePath: string): boolean => {
     return VIDEO_EXTENSIONS.has(ext);
 };
 
+const MAX_VIDEO_SIZE_MB = parseInt(process.env.MAX_VIDEO_SIZE_MB || '50', 10);
+const MAX_IMAGE_SIZE_MB = parseInt(process.env.MAX_IMAGE_SIZE_MB || '25', 10);
+const MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024;
+const MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024;
+
+const getMediaFileSize = async (filePath: string): Promise<number | null> => {
+    try {
+        const stat = await fsPromises.stat(filePath);
+        return stat.size;
+    } catch {
+        return null;
+    }
+};
+
 interface TextEntry {
     content: string;
     type: 'poem' | 'quote';
@@ -376,22 +390,35 @@ app.get('/api/next-memory', async (req, res) => {
             return res.status(503).json({ error: "Library empty or indexing..." });
         }
 
-        // 1. SELECT PHOTO
-        let selectedPhoto = selectSmartPhoto();
-        if (!selectedPhoto) {
-             selectedPhoto = photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+        // 1. SELECT VALID MEDIA CANDIDATE WITHIN SIZE LIMITS
+        let selectedPhoto: Photo | null = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const candidate = selectSmartPhoto() || photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+            if (!candidate) break;
+
+            const size = await getMediaFileSize(candidate.path);
+            if (size === null || size <= 0) {
+                if (!isNasOffline) {
+                    photoLibrary = photoLibrary.filter(p => p.path !== candidate.path);
+                    photoPaths.delete(candidate.path);
+                    isDirtyPhotos = true;
+                }
+                continue;
+            }
+
+            const isVideo = candidate.mediaType === 'video' || isVideoFile(candidate.path);
+            const maxSize = isVideo ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
+            if (size > maxSize) {
+                console.warn(`⚠️ Skipping oversized media (${(size / (1024 * 1024)).toFixed(1)}MB > ${isVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB}MB): ${path.basename(candidate.path)}`);
+                continue;
+            }
+
+            selectedPhoto = candidate;
+            break;
         }
 
-        // ASYNC: Check if chosen photo still exists
-        const photoExists = await fileExists(selectedPhoto.path);
-        if (!photoExists) {
-            // CRITICAL FIX: Only purge the memory if we KNOW the NAS is online (meaning it was actually deleted).
-            if (!isNasOffline) {
-                photoLibrary = photoLibrary.filter(p => p.path !== selectedPhoto!.path);
-                photoPaths.delete(selectedPhoto!.path);
-                isDirtyPhotos = true;
-            }
-            return res.status(500).json({ error: "File missing or NAS unreachable" });
+        if (!selectedPhoto) {
+            return res.status(503).json({ error: "No suitable media candidates found within size limits." });
         }
 
         const isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
@@ -521,10 +548,17 @@ const handleMediaServing = async (req: express.Request, res: express.Response) =
         return res.end(img);
     }
     
-    const exists = await fileExists(filePath);
-    if (!exists) return res.status(404).send('Media not found');
+    const size = await getMediaFileSize(filePath);
+    if (size === null || size <= 0) return res.status(404).send('Media not found');
 
     const ext = path.extname(filePath).toLowerCase();
+    const isVideo = VIDEO_EXTENSIONS.has(ext);
+    const maxSize = isVideo ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
+    if (size > maxSize) {
+        console.warn(`⛔ Refused oversized media request: ${path.basename(filePath)} (${(size / (1024 * 1024)).toFixed(1)}MB > ${isVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB}MB)`);
+        return res.status(413).send(`Media file exceeds maximum allowed size of ${isVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB}MB`);
+    }
+
     const mimeTypes: Record<string, string> = {
         '.mp4': 'video/mp4',
         '.mov': 'video/quicktime',
