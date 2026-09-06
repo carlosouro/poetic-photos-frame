@@ -53,6 +53,24 @@
             letter-spacing: 1px; opacity: 0; transition: opacity 2s ease-in-out 1s;
         }
 
+        /* BOTTOM LEFT VIDEO TIMER BADGE */
+        #video-indicator {
+            position: absolute; bottom: 25px; left: 30px;
+            display: flex; align-items: center; gap: 8px;
+            font-family: 'Montserrat', sans-serif; font-size: 0.85rem; color: #ccc;
+            letter-spacing: 1px;
+            background: rgba(0, 0, 0, 0.45);
+            padding: 5px 12px; border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(8px);
+            opacity: 0; pointer-events: none;
+            transition: opacity 0.8s ease-in-out;
+            z-index: 20;
+        }
+        #video-indicator.visible { opacity: 1; }
+        #video-status-icon { font-size: 0.75rem; color: #4cd137; }
+        #video-time-text { font-variant-numeric: tabular-nums; }
+
         /* TOP RIGHT HEART ICON */
         #quick-fav {
             position: absolute; top: 30px; right: 30px; z-index: 60;
@@ -156,6 +174,10 @@
                 <div id="poem-text"></div>
                 <div id="author-text"></div>
             </div>
+            <div id="video-indicator">
+                <span id="video-status-icon">▶</span>
+                <span id="video-time-text">0:00 / 0:00</span>
+            </div>
             <div id="date-display"></div>
         </div>
 
@@ -224,6 +246,17 @@
         const poemEl = document.getElementById('poem-text');
         const authorEl = document.getElementById('author-text');
         const dateEl = document.getElementById('date-display');
+        const videoIndicatorEl = document.getElementById('video-indicator');
+        const videoStatusIcon = document.getElementById('video-status-icon');
+        const videoTimeText = document.getElementById('video-time-text');
+        let videoEndedTriggered = false;
+
+        function formatTime(seconds) {
+            if (isNaN(seconds) || !isFinite(seconds) || seconds < 0) return '--:--';
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+        }
         
         const loaderOverlay = document.getElementById('loader-overlay');
         const loaderText = document.getElementById('loader-text');
@@ -270,12 +303,42 @@
         // Initial state: hide cursor by default
         document.body.classList.add('hide-cursor');
 
-        // Video playback event listeners
-        videoEl.addEventListener('ended', () => {
-            if (!currentMemory || !currentMemory.isVideo) return;
+        // Video playback event listeners & completion handling
+        function onVideoEnd() {
+            if (!currentMemory || !currentMemory.isVideo || videoEndedTriggered) return;
+            videoEndedTriggered = true;
             if (displayTimer) clearTimeout(displayTimer);
             console.log("🎬 Video finished playing, advancing to next memory.");
-            updateDisplay(false);
+            // Brief 400ms hold on final frame for seamless transition
+            setTimeout(() => updateDisplay(false), 400);
+        }
+
+        videoEl.addEventListener('ended', onVideoEnd);
+
+        videoEl.addEventListener('timeupdate', () => {
+            if (!currentMemory || !currentMemory.isVideo) return;
+            const cur = videoEl.currentTime;
+            const dur = videoEl.duration;
+            videoTimeText.innerText = `${formatTime(cur)} / ${formatTime(dur)}`;
+
+            // Near-end completion guard (catches codecs that stall or skip native 'ended')
+            if (dur > 0 && cur >= dur - 0.25) {
+                onVideoEnd();
+            }
+        });
+
+        videoEl.addEventListener('loadedmetadata', () => {
+            if (!currentMemory || !currentMemory.isVideo) return;
+            const dur = videoEl.duration;
+            videoTimeText.innerText = `0:00 / ${formatTime(dur)}`;
+            if (dur && isFinite(dur) && dur > 0) {
+                if (displayTimer) clearTimeout(displayTimer);
+                const safeTimeoutMs = Math.max((dur + 3) * 1000, 8000);
+                displayTimer = setTimeout(() => {
+                    console.log("Video dynamic safety timer reached, advancing...");
+                    onVideoEnd();
+                }, safeTimeoutMs);
+            }
         });
 
         videoEl.addEventListener('error', (e) => {
@@ -358,6 +421,7 @@
             if (!memory) return;
 
             if (memory.isVideo) {
+                videoEndedTriggered = false;
                 photoEl.style.display = 'none';
                 photoEl.src = '';
                 videoEl.style.display = 'block';
@@ -368,7 +432,12 @@
                 poemEl.innerText = "";
                 poemEl.style.display = 'none';
                 authorEl.style.display = 'none';
+
+                videoStatusIcon.innerText = "▶";
+                videoTimeText.innerText = "0:00 / --:--";
+                videoIndicatorEl.classList.add('visible');
             } else {
+                videoIndicatorEl.classList.remove('visible');
                 try { videoEl.pause(); } catch(e) {}
                 videoEl.src = '';
                 videoEl.style.display = 'none';
@@ -494,6 +563,7 @@
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
+                videoIndicatorEl.classList.remove('visible');
                 
                 await new Promise(r => setTimeout(r, 800)); 
 
@@ -503,18 +573,21 @@
                 if (memory.isVideo) {
                     videoEl.style.opacity = 1;
                     dateEl.style.opacity = 1;
+                    videoIndicatorEl.classList.add('visible');
 
                     videoEl.play().catch(err => {
                         console.warn("Video play error:", err);
                         displayTimer = setTimeout(() => updateDisplay(false), 2000);
                     });
 
-                    // 60-second safety cap for long video clips
+                    // Dynamic safety cap: duration + 3s if duration is already known, otherwise default 45s
                     if (displayTimer) clearTimeout(displayTimer);
+                    const dur = videoEl.duration;
+                    const safeTimeoutMs = (dur && isFinite(dur) && dur > 0) ? Math.max((dur + 3) * 1000, 8000) : 45000;
                     displayTimer = setTimeout(() => {
-                        console.log("Video 60s max safety cap reached, advancing...");
-                        updateDisplay(false);
-                    }, 60000);
+                        console.log("Video safety cap reached, advancing...");
+                        onVideoEnd();
+                    }, safeTimeoutMs);
                 } else {
                     photoEl.style.opacity = 1;
                     poemEl.style.opacity = 1;
@@ -551,6 +624,7 @@
             if (displayTimer) clearTimeout(displayTimer); 
             if (currentMemory && currentMemory.isVideo) {
                 try { videoEl.pause(); } catch(e) {}
+                videoStatusIcon.innerText = "⏸";
             }
             menuOverlay.classList.add('overlay-visible');
         });
@@ -581,10 +655,14 @@
                 menuOverlay.classList.remove('overlay-visible');
                 if (displayTimer) clearTimeout(displayTimer);
                 if (currentMemory && currentMemory.isVideo) {
+                    videoStatusIcon.innerText = "▶";
                     videoEl.play().catch(e => {});
+                    const dur = videoEl.duration;
+                    const cur = videoEl.currentTime;
+                    const safeRemainingMs = (dur && isFinite(dur) && dur > 0) ? Math.max((dur - cur + 3) * 1000, 3000) : 45000;
                     displayTimer = setTimeout(() => {
-                        updateDisplay(false);
-                    }, 60000);
+                        onVideoEnd();
+                    }, safeRemainingMs);
                 } else {
                     displayTimer = setTimeout(updateDisplay, currentInterval);
                 }
