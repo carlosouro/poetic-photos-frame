@@ -239,7 +239,13 @@
         sliderEl.value = currentInterval / 1000;
         intervalDisplayEl.innerText = `${sliderEl.value}s`;
 
-        function showLoader(msg = "Loading...") {
+        // Ring buffer for offline/fault-tolerant playback
+        const memoryBuffer = [];
+        const BUFFER_CAP = 30;
+
+        function showLoader(msg = "Loading...", force = false) {
+            // NEVER cover the screen if a memory is already displaying, unless forced by user action
+            if (!force && currentMemory) return;
             loaderText.innerText = msg;
             loaderOverlay.classList.add('visible');
         }
@@ -277,9 +283,8 @@
         });
 
         async function fetchNextMemory() {
-            // 25s timeout limit for fetching memory metadata
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 25000);
+            const timeoutId = setTimeout(() => controller.abort(), 20000);
 
             try {
                 const response = await fetch('/api/next-memory', { signal: controller.signal });
@@ -339,12 +344,14 @@
                     });
                 }
             } catch (error) {
-                console.error("Fetch failed:", error);
-                throw error;
+                console.warn("Background fetch failed:", error);
+                return null;
             }
         }
 
         function renderMemory(memory) {
+            if (!memory) return;
+
             if (memory.isVideo) {
                 photoEl.style.display = 'none';
                 photoEl.src = '';
@@ -363,8 +370,8 @@
                 photoEl.style.display = 'block';
                 photoEl.src = memory.imageSrc || `/api/image?path=${memory.imagePathEncoded}`;
 
-                poemEl.innerText = `"${memory.text}"`;
-                poemEl.style.display = 'block';
+                poemEl.innerText = memory.text ? `"${memory.text}"` : "";
+                poemEl.style.display = memory.text ? 'block' : 'none';
                 
                 if (memory.type === 'quote' && memory.author) {
                     authorEl.innerText = memory.author === 'System Alert' ? memory.author : `- ${memory.author}`;
@@ -390,6 +397,14 @@
             } else {
                 dateEl.innerText = ""; 
             }
+
+            // Buffer successfully loaded memory
+            if (memory.imagePathEncoded && !memory.imagePathEncoded.includes('__error_placeholder__')) {
+                if (!memoryBuffer.some(m => m.imagePathEncoded === memory.imagePathEncoded)) {
+                    memoryBuffer.push(memory);
+                    if (memoryBuffer.length > BUFFER_CAP) memoryBuffer.shift();
+                }
+            }
         }
 
         async function updateDisplay(useHistory = false) {
@@ -399,23 +414,50 @@
             try {
                 if (displayTimer) clearTimeout(displayTimer);
 
-                if (!nextMemoryPromise && !useHistory) {
-                    showLoader("Loading...");
+                // Show loader ONLY on very initial boot if nothing is visible
+                if (!currentMemory) {
+                    showLoader("Loading memories...");
                 }
 
-                let memory;
+                let memory = null;
                 if (useHistory && historyStack.length > 0) {
                     memory = historyStack.pop();
                     nextMemoryPromise = null; 
                 } else {
                     if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                     
-                    if (currentMemory) {
-                        historyStack.push(currentMemory);
-                        if (historyStack.length > HISTORY_LIMIT) historyStack.shift();
+                    try {
+                        memory = await nextMemoryPromise;
+                    } catch (e) {
+                        console.warn("Awaiting memory promise failed:", e);
+                        memory = null;
                     }
-                    
-                    memory = await nextMemoryPromise;
+                    nextMemoryPromise = null;
+                }
+
+                // If fetch returned null (e.g. temporary network drop)
+                if (!memory) {
+                    // Fallback to buffered memories
+                    if (memoryBuffer.length > 0) {
+                        const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
+                        memory = candidates.length > 0 
+                            ? candidates[Math.floor(Math.random() * candidates.length)]
+                            : memoryBuffer[0];
+                        console.log("ℹ️ Seamless fallback to buffered memory:", memory.imagePathEncoded);
+                    }
+                }
+
+                // If still no memory (cold startup before first photo loaded)
+                if (!memory) {
+                    if (!currentMemory) showLoader("Waiting for memories...");
+                    if (displayTimer) clearTimeout(displayTimer);
+                    displayTimer = setTimeout(() => updateDisplay(false), 3000);
+                    return;
+                }
+
+                if (currentMemory && memory.imagePathEncoded !== currentMemory.imagePathEncoded) {
+                    historyStack.push(currentMemory);
+                    if (historyStack.length > HISTORY_LIMIT) historyStack.shift();
                 }
 
                 currentMemory = memory;
@@ -456,14 +498,15 @@
                     displayTimer = setTimeout(updateDisplay, currentInterval);
                 }
 
-                nextMemoryPromise = fetchNextMemory().catch(e => console.warn("Background fetch failed"));
+                // Start preloading the next memory quietly in the background
+                nextMemoryPromise = fetchNextMemory();
 
             } catch (error) {
-                console.error("Display update failed:", error);
-                showLoader("Retrying Connection...");
+                console.error("Display update unexpected error:", error);
                 nextMemoryPromise = null;
+                if (!currentMemory) showLoader("Retrying Connection...");
                 if (displayTimer) clearTimeout(displayTimer);
-                displayTimer = setTimeout(() => updateDisplay(false), 3000); 
+                displayTimer = setTimeout(() => updateDisplay(false), 4000); 
             } finally {
                 isProcessing = false;
             }
@@ -486,7 +529,6 @@
 
         document.getElementById('zone-right').addEventListener('click', () => {
             if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
-            showLoader("Loading...");
             updateDisplay(false); 
         });
 
@@ -524,7 +566,7 @@
                 if (!currentMemory || isProcessing) return;
                 isProcessing = true;
                 
-                showLoader(quickFavBtn.classList.contains('active') ? "Removing..." : "Favoriting...");
+                showLoader(quickFavBtn.classList.contains('active') ? "Removing..." : "Favoriting...", true);
                 
                 try {
                     const res = await fetch('/api/favorite', {
@@ -557,7 +599,7 @@
                 if (!currentMemory || isProcessing) return;
                 
                 isProcessing = true;
-                showLoader("Omitting...");
+                showLoader("Omitting...", true);
                 
                 try {
                     const res = await fetch('/api/omit', {
@@ -613,7 +655,7 @@
             doDelete: async () => {
                 if (!currentMemory || isProcessing) return;
                 isProcessing = true;
-                showLoader("Deleting...");
+                showLoader("Deleting...", true);
                 
                 try {
                     const res = await fetch('/api/photo', {
@@ -643,7 +685,7 @@
             reload: () => window.location.reload(),
             exit: async () => {
                 if (confirm("Exit?")) {
-                    showLoader("Shutting Down...");
+                    showLoader("Shutting Down...", true);
                     await fetch('/api/exit', { method: 'POST' });
                 }
             }

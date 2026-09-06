@@ -241,24 +241,25 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
     });
 };
 
-const performIndexing = async (clearCache: boolean) => {
+const performIndexing = async (clearCache: boolean = false) => {
     if (NAS_ROOT_PATH && !(await checkNasConnection())) {
         isIndexing = false;
         return; 
     }
 
-    isIndexing = true;
-
-    if (clearCache) {
-        photoLibrary = [];
-        photoPaths.clear();
-        isDirtyPhotos = true; 
-        try { await runIndexer('defaults'); } catch (e) { console.error("Defaults load failed"); }
+    if (isIndexing) {
+        console.log("ℹ️ Indexing already in progress. Skipping duplicate request.");
+        return;
     }
 
+    isIndexing = true;
+    console.log(`🚀 Starting zero-downtime background indexing (preserving ${photoLibrary.length} active cached photos)...`);
+
+    // ZERO-DOWNTIME: We DO NOT wipe photoLibrary so active memories keep serving without disruption!
     runIndexer('full')
         .then(() => {
-            savePhotosToDisk(); 
+            savePhotosToDisk();
+            console.log(`✅ Indexing completed. Library size: ${photoLibrary.length} items.`);
         })
         .catch(err => console.error("❌ Background index failed:", err))
         .finally(() => isIndexing = false);
@@ -380,14 +381,25 @@ app.get('/api/next-memory', async (req, res) => {
                     type: 'quote',
                     author: "System Alert",
                     date: new Date().toISOString(),
-                    imagePathEncoded: ERROR_IMAGE_MARKER,
+                    imagePathEncoded: encodeURIComponent(ERROR_IMAGE_MARKER),
+                    mediaUrl: `/api/image?path=${encodeURIComponent(ERROR_IMAGE_MARKER)}`,
+                    isVideo: false,
                     isFavorite: false
                 });
             }
         }
 
         if (photoLibrary.length === 0) {
-            return res.status(503).json({ error: "Library empty or indexing..." });
+            return res.json({
+                text: "Loading memories from storage...",
+                type: 'quote',
+                author: "Poetic Memories",
+                date: new Date().toISOString(),
+                imagePathEncoded: encodeURIComponent(ERROR_IMAGE_MARKER),
+                mediaUrl: `/api/image?path=${encodeURIComponent(ERROR_IMAGE_MARKER)}`,
+                isVideo: false,
+                isFavorite: false
+            });
         }
 
         // 1. SELECT VALID MEDIA CANDIDATE WITHIN SIZE LIMITS
@@ -418,7 +430,16 @@ app.get('/api/next-memory', async (req, res) => {
         }
 
         if (!selectedPhoto) {
-            return res.status(503).json({ error: "No suitable media candidates found within size limits." });
+            return res.json({
+                text: isNasOffline ? "Waiting for storage connection..." : "Finding your next memory...",
+                type: 'quote',
+                author: "System Alert",
+                date: new Date().toISOString(),
+                imagePathEncoded: encodeURIComponent(ERROR_IMAGE_MARKER),
+                mediaUrl: `/api/image?path=${encodeURIComponent(ERROR_IMAGE_MARKER)}`,
+                isVideo: false,
+                isFavorite: false
+            });
         }
 
         const isFavorite = selectedPhoto.path.includes(DEFAULTS_FOLDER_NAME);
@@ -714,11 +735,11 @@ app.post('/api/exit', (req, res) => {
 
 app.post('/api/reindex', (req, res) => {
     res.json({ message: 'Reindexing started...' });
-    performIndexing(true);
+    performIndexing(false);
 });
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
     loadLibraries();
-    if (photoLibrary.length === 0) performIndexing(true);
+    if (photoLibrary.length === 0) performIndexing(false);
 });
