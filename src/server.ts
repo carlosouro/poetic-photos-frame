@@ -165,15 +165,19 @@ const saveTextsToDisk = async () => {
 
 // --- SMART PHOTO SELECTION ---
 
-function selectSmartPhoto(): Photo | null {
+function selectSmartPhoto(excludePath?: string | null): Photo | null {
     if (photoLibrary.length === 0) return null;
+
+    const baseLibrary = excludePath && photoLibrary.length > 1
+        ? photoLibrary.filter(p => p.path !== excludePath)
+        : photoLibrary;
 
     const now = new Date();
     const msPerDay = 1000 * 60 * 60 * 24;
 
-    const favorites = photoLibrary.filter(p => p.path.includes(DEFAULTS_FOLDER_NAME));
+    const favorites = baseLibrary.filter(p => p.path.includes(DEFAULTS_FOLDER_NAME));
 
-    const smartCandidates = photoLibrary.filter(photo => {
+    const smartCandidates = baseLibrary.filter(photo => {
         const pDate = new Date(photo.created);
         if (isNaN(pDate.getTime())) return false;
 
@@ -207,7 +211,7 @@ function selectSmartPhoto(): Photo | null {
         }
     }
 
-    return photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+    return baseLibrary[Math.floor(Math.random() * baseLibrary.length)];
 }
 
 // --- INDEXING LOGIC ---
@@ -403,9 +407,10 @@ app.get('/api/next-memory', async (req, res) => {
         }
 
         // 1. SELECT VALID MEDIA CANDIDATE WITHIN SIZE LIMITS
+        const currentPath = req.query.current ? decodeURIComponent(req.query.current as string) : null;
         let selectedPhoto: Photo | null = null;
         for (let attempt = 0; attempt < 5; attempt++) {
-            const candidate = selectSmartPhoto() || photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+            const candidate = selectSmartPhoto(currentPath) || (currentPath ? photoLibrary.find(p => p.path !== currentPath) : null) || photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
             if (!candidate) break;
 
             const size = await getMediaFileSize(candidate.path);
@@ -483,7 +488,7 @@ app.get('/api/next-memory', async (req, res) => {
             if (isGeneratingAI) {
                 console.log("⚠️ Backend is busy. Forcing a cached fallback memory.");
                 const cachedPaths = Object.keys(textLibrary);
-                const availableCachedPhotos = photoLibrary.filter(p => cachedPaths.includes(p.path));
+                const availableCachedPhotos = photoLibrary.filter(p => cachedPaths.includes(p.path) && (!currentPath || p.path !== currentPath));
                 
                 if (availableCachedPhotos.length > 0) {
                     selectedPhoto = availableCachedPhotos[Math.floor(Math.random() * availableCachedPhotos.length)];

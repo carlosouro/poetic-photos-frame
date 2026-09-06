@@ -15,3 +15,4 @@ dist/
 # Local cache & logs
 cache/
 *.log
+.playwright-cli/

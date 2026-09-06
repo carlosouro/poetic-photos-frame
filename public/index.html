@@ -242,6 +242,7 @@
         // Ring buffer for offline/fault-tolerant playback
         const memoryBuffer = [];
         const BUFFER_CAP = 30;
+        const HISTORY_LIMIT = 50;
 
         function showLoader(msg = "Loading...", force = false) {
             // NEVER cover the screen if a memory is already displaying, unless forced by user action
@@ -287,10 +288,11 @@
 
         async function fetchNextMemory() {
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 20000);
+            const timeoutId = setTimeout(() => controller.abort(), 45000);
 
             try {
-                const response = await fetch('/api/next-memory', { signal: controller.signal });
+                const query = currentMemory?.imagePathEncoded ? `?current=${encodeURIComponent(currentMemory.imagePathEncoded)}` : '';
+                const response = await fetch(`/api/next-memory${query}`, { signal: controller.signal });
                 clearTimeout(timeoutId);
                 
                 if (!response.ok) throw new Error(`Server Error: ${response.status}`);
@@ -324,7 +326,7 @@
                                 cleanup();
                                 resolve({ ...data, mediaSrc: vid.src, isVideo: true });
                             }
-                        }, 8000);
+                        }, 10000);
                         const cleanup = () => {
                             clearTimeout(timeout);
                             vid.removeEventListener('loadeddata', onLoaded);
@@ -343,7 +345,7 @@
                         img.src = data.mediaUrl || `/api/image?path=${data.imagePathEncoded}`;
                         img.onload = () => resolve({ ...data, imageSrc: img.src, isVideo: false });
                         img.onerror = () => reject(new Error("Image load failed"));
-                        setTimeout(() => reject(new Error("Image load timed out")), 20000);
+                        setTimeout(() => reject(new Error("Image load timed out")), 25000);
                     });
                 }
             } catch (error) {
@@ -443,9 +445,8 @@
                         console.warn("Awaiting memory promise failed:", e);
                         memory = null;
                     }
-                    if (memory) {
-                        nextMemoryPromise = null;
-                    }
+                    // ALWAYS reset nextMemoryPromise once awaited so subsequent cycles fetch fresh
+                    nextMemoryPromise = null;
                 }
 
                 // If fetch returned null (e.g. temporary network drop or user tap race timeout)
@@ -457,10 +458,22 @@
                     }
                 }
 
+                // If user tapped Next and no memory was ready (e.g. initial boot before buffer fills), actively fetch
+                if (!memory && isUserTap) {
+                    showLoader("Loading next memory...");
+                    try {
+                        memory = await fetchNextMemory();
+                    } catch (e) {
+                        memory = null;
+                    }
+                    hideLoader();
+                }
+
                 // If still no memory, or if it resolves to the exact same memory currently displayed:
                 // Keep current memory peacefully on screen and retry in 2 seconds. NEVER flash the screen!
                 if (!memory || (currentMemory && memory.imagePathEncoded === currentMemory.imagePathEncoded)) {
                     if (!currentMemory) showLoader("Waiting for memories...");
+                    if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
                     if (displayTimer) clearTimeout(displayTimer);
                     displayTimer = setTimeout(() => updateDisplay(false), 2000);
                     return;
