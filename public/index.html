@@ -315,17 +315,34 @@
 
         videoEl.addEventListener('ended', onVideoEnd);
 
+        let decodedFrameCheckDone = false;
+        videoEl.addEventListener('playing', () => {
+            decodedFrameCheckDone = false;
+        });
+
         videoEl.addEventListener('timeupdate', () => {
             if (!currentMemory || !currentMemory.isVideo) return;
             const cur = videoEl.currentTime;
             const dur = videoEl.duration;
             videoTimeText.innerText = `${formatTime(cur)} / ${formatTime(dur)}`;
 
+            // Black screen watchdog: if playback has progressed 1.5s but 0 frames were decoded,
+            // the video codec is unsupported by the browser decoder. Advance immediately.
+            if (!decodedFrameCheckDone && cur > 1.5) {
+                decodedFrameCheckDone = true;
+                if (typeof videoEl.webkitDecodedFrameCount === 'number' && videoEl.webkitDecodedFrameCount === 0) {
+                    console.warn("⚠️ Detected unsupported video codec (0 decoded visual frames). Skipping black video...");
+                    onVideoEnd();
+                    return;
+                }
+            }
+
             // Near-end completion guard (catches codecs that stall or skip native 'ended')
             if (dur > 0 && cur >= dur - 0.25) {
                 onVideoEnd();
             }
         });
+
 
         videoEl.addEventListener('loadedmetadata', () => {
             if (!currentMemory || !currentMemory.isVideo) return;

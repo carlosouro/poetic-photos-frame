@@ -7,6 +7,10 @@ import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import sharp from 'sharp';
 import { exec, fork } from 'child_process';
+import { promisify } from 'util';
+import crypto from 'crypto';
+
+const execAsync = promisify(exec);
 
 dotenv.config();
 
@@ -54,6 +58,159 @@ const MAX_VIDEO_SIZE_MB = parseInt(process.env.MAX_VIDEO_SIZE_MB || '50', 10);
 const MAX_IMAGE_SIZE_MB = parseInt(process.env.MAX_IMAGE_SIZE_MB || '25', 10);
 const MAX_VIDEO_SIZE_BYTES = MAX_VIDEO_SIZE_MB * 1024 * 1024;
 const MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024;
+
+// Display & Video Optimization Configuration
+const FRAME_SCREEN_WIDTH = parseInt(process.env.FRAME_SCREEN_WIDTH || '1280', 10);
+const FRAME_SCREEN_HEIGHT = parseInt(process.env.FRAME_SCREEN_HEIGHT || '800', 10);
+const MAX_VIDEO_DURATION_SECONDS = parseInt(process.env.MAX_VIDEO_DURATION_SECONDS || '30', 10);
+const VIDEO_CACHE_DIR = path.resolve(process.env.VIDEO_CACHE_DIR || path.join(CACHE_DIR, 'transcoded'));
+const VIDEO_CACHE_MAX_FILES = 100;
+
+if (!fs.existsSync(VIDEO_CACHE_DIR)) {
+    fs.mkdirSync(VIDEO_CACHE_DIR, { recursive: true });
+}
+
+const activeTranscodes = new Map<string, Promise<string>>();
+
+const getVideoCacheKey = (filePath: string, mtimeMs: number): string => {
+    return crypto.createHash('sha256')
+        .update(`${filePath}:${mtimeMs}:${FRAME_SCREEN_WIDTH}x${FRAME_SCREEN_HEIGHT}:${MAX_VIDEO_DURATION_SECONDS}`)
+        .digest('hex')
+        .substring(0, 24);
+};
+
+const getCachedOptimizedVideoPath = async (filePath: string): Promise<string | null> => {
+    try {
+        const stat = await fsPromises.stat(filePath);
+        const cacheKey = getVideoCacheKey(filePath, stat.mtimeMs);
+        const cachedPath = path.join(VIDEO_CACHE_DIR, `${cacheKey}.mp4`);
+        if (fs.existsSync(cachedPath)) {
+            const cachedStat = await fsPromises.stat(cachedPath);
+            if (cachedStat.size > 1000) {
+                const now = new Date();
+                await fsPromises.utimes(cachedPath, now, now).catch(() => {});
+                return cachedPath;
+            }
+        }
+    } catch {}
+    return null;
+};
+
+const cleanupVideoCache = async (): Promise<void> => {
+    try {
+        const files = await fsPromises.readdir(VIDEO_CACHE_DIR);
+        const mp4Files = files.filter(f => f.endsWith('.mp4') && !f.endsWith('.tmp.mp4'));
+        if (mp4Files.length <= VIDEO_CACHE_MAX_FILES) return;
+
+        const fileStats = await Promise.all(
+            mp4Files.map(async f => {
+                const fullPath = path.join(VIDEO_CACHE_DIR, f);
+                try {
+                    const st = await fsPromises.stat(fullPath);
+                    return { fullPath, mtime: st.mtimeMs };
+                } catch {
+                    return null;
+                }
+            })
+        );
+
+        const validStats = fileStats.filter((item): item is { fullPath: string; mtime: number } => item !== null);
+        validStats.sort((a, b) => a.mtime - b.mtime); // Oldest first
+
+        const toDeleteCount = validStats.length - Math.floor(VIDEO_CACHE_MAX_FILES * 0.85); // Prune to 85%
+        for (let i = 0; i < toDeleteCount; i++) {
+            await fsPromises.unlink(validStats[i].fullPath).catch(() => {});
+        }
+        console.log(`🧹 Video cache cleaned up: removed ${toDeleteCount} older cached clips.`);
+    } catch (e) {
+        console.warn("⚠️ Video cache cleanup error:", e);
+    }
+};
+
+const ensureOptimizedVideo = async (filePath: string): Promise<string> => {
+    let stat: fs.Stats;
+    try {
+        stat = await fsPromises.stat(filePath);
+    } catch {
+        return filePath;
+    }
+
+    const cacheKey = getVideoCacheKey(filePath, stat.mtimeMs);
+    const cachedPath = path.join(VIDEO_CACHE_DIR, `${cacheKey}.mp4`);
+
+    if (fs.existsSync(cachedPath)) {
+        try {
+            const cachedStat = await fsPromises.stat(cachedPath);
+            if (cachedStat.size > 1000) {
+                const now = new Date();
+                await fsPromises.utimes(cachedPath, now, now).catch(() => {});
+                return cachedPath;
+            }
+        } catch {}
+    }
+
+    if (activeTranscodes.has(cacheKey)) {
+        return activeTranscodes.get(cacheKey)!;
+    }
+
+    const transcodePromise = (async () => {
+        try {
+            const probeCmd = `ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate -show_entries format=duration -of json "${filePath}"`;
+            let duration = 0;
+            let codec = '';
+            let width = 0;
+            let height = 0;
+
+            try {
+                const { stdout } = await execAsync(probeCmd);
+                const info = JSON.parse(stdout);
+                duration = parseFloat(info?.format?.duration || '0');
+                const stream = info?.streams?.[0];
+                codec = stream?.codec_name || '';
+                width = parseInt(stream?.width || '0', 10);
+                height = parseInt(stream?.height || '0', 10);
+            } catch (probeErr) {
+                console.warn(`⚠️ ffprobe failed for ${path.basename(filePath)}:`, probeErr);
+            }
+
+            let startTime = 0;
+            let clipDuration = duration > 0 ? duration : MAX_VIDEO_DURATION_SECONDS;
+            if (duration > MAX_VIDEO_DURATION_SECONDS) {
+                startTime = Math.max(0, Math.floor((duration - MAX_VIDEO_DURATION_SECONDS) / 2));
+                clipDuration = MAX_VIDEO_DURATION_SECONDS;
+            }
+
+            const tempPath = path.join(VIDEO_CACHE_DIR, `${cacheKey}.tmp.mp4`);
+
+            console.log(`🎬 Optimizing video: ${path.basename(filePath)} (${codec || 'unknown'}, ${width}x${height}, dur: ${duration.toFixed(1)}s -> clip ${clipDuration}s from ${startTime}s, target: <=${FRAME_SCREEN_WIDTH}x${FRAME_SCREEN_HEIGHT} @ 30fps)...`);
+
+            const scaleFilter = `scale=${FRAME_SCREEN_WIDTH}:${FRAME_SCREEN_HEIGHT}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+            const ffmpegCmd = `nice -n 15 ffmpeg -y -ss ${startTime} -t ${clipDuration} -i "${filePath}" -vf "${scaleFilter}" -r 30 -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -threads 2 -movflags +faststart "${tempPath}"`;
+
+            await execAsync(ffmpegCmd);
+
+            const tempStat = await fsPromises.stat(tempPath);
+            if (tempStat.size <= 1000) {
+                throw new Error("Transcoded file is empty or corrupted");
+            }
+
+            await fsPromises.rename(tempPath, cachedPath);
+            console.log(`✅ Video optimized and cached: ${cacheKey}.mp4 (${(tempStat.size / (1024 * 1024)).toFixed(2)} MB)`);
+
+            cleanupVideoCache().catch(() => {});
+
+            return cachedPath;
+        } catch (err) {
+            console.error(`❌ Video optimization failed for ${path.basename(filePath)}:`, err);
+            return filePath;
+        } finally {
+            activeTranscodes.delete(cacheKey);
+        }
+    })();
+
+    activeTranscodes.set(cacheKey, transcodePromise);
+    return transcodePromise;
+};
 
 const getMediaFileSize = async (filePath: string): Promise<number | null> => {
     try {
@@ -452,17 +609,24 @@ app.get('/api/next-memory', async (req, res) => {
 
         // If it's a video, bypass Gemini AI generation completely
         if (isVideo) {
+            const videoPath = selectedPhoto.path;
+            // Kick off background/pre-buffering optimization so it's ready when played
+            ensureOptimizedVideo(videoPath).catch(err => {
+                console.warn(`⚠️ Pre-transcoding error for ${path.basename(videoPath)}:`, err);
+            });
+
             return res.json({
                 text: "",
                 type: 'video',
                 author: null,
                 date: selectedPhoto.created,
-                imagePathEncoded: encodeURIComponent(selectedPhoto.path),
-                mediaUrl: `/api/media?path=${encodeURIComponent(selectedPhoto.path)}`,
+                imagePathEncoded: encodeURIComponent(videoPath),
+                mediaUrl: `/api/media?path=${encodeURIComponent(videoPath)}`,
                 isVideo: true,
                 isFavorite: isFavorite
             });
         }
+
 
         let aiResponse: TextEntry | null = null;
         let duplicateDetected = false;
@@ -579,17 +743,33 @@ const handleMediaServing = async (req: express.Request, res: express.Response) =
 
     const ext = path.extname(filePath).toLowerCase();
     const isVideo = VIDEO_EXTENSIONS.has(ext);
-    const maxSize = isVideo ? MAX_VIDEO_SIZE_BYTES : MAX_IMAGE_SIZE_BYTES;
-    if (size > maxSize) {
-        console.warn(`⛔ Refused oversized media request: ${path.basename(filePath)} (${(size / (1024 * 1024)).toFixed(1)}MB > ${isVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB}MB)`);
-        return res.status(413).send(`Media file exceeds maximum allowed size of ${isVideo ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB}MB`);
+
+    if (isVideo) {
+        let servePath = filePath;
+        try {
+            const optimizedPath = await ensureOptimizedVideo(filePath);
+            if (optimizedPath && fs.existsSync(optimizedPath)) {
+                servePath = optimizedPath;
+            }
+        } catch (err) {
+            console.warn(`⚠️ Serving raw video for ${path.basename(filePath)} after optimization error:`, err);
+        }
+
+        return res.sendFile(path.resolve(servePath), {
+            acceptRanges: true,
+            headers: {
+                'Content-Type': 'video/mp4',
+                'Accept-Ranges': 'bytes'
+            }
+        });
+    }
+
+    if (size > MAX_IMAGE_SIZE_BYTES) {
+        console.warn(`⛔ Refused oversized image request: ${path.basename(filePath)} (${(size / (1024 * 1024)).toFixed(1)}MB > ${MAX_IMAGE_SIZE_MB}MB)`);
+        return res.status(413).send(`Image file exceeds maximum allowed size of ${MAX_IMAGE_SIZE_MB}MB`);
     }
 
     const mimeTypes: Record<string, string> = {
-        '.mp4': 'video/mp4',
-        '.mov': 'video/mp4', // ISO-BMFF container supported natively by Chromium HTML5 media player
-        '.m4v': 'video/mp4',
-        '.webm': 'video/webm',
         '.jpg': 'image/jpeg',
         '.jpeg': 'image/jpeg',
         '.png': 'image/png',
@@ -605,6 +785,7 @@ const handleMediaServing = async (req: express.Request, res: express.Response) =
         }
     });
 };
+
 
 app.get('/api/image', handleMediaServing);
 app.get('/api/media', handleMediaServing);

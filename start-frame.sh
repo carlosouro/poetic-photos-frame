@@ -68,6 +68,4 @@ else
     BROWSER="chromium"
 fi
 
-# 9. Launch Browser
-# Using the dynamic PORT variable
-$BROWSER --kiosk --noerrdialogs --disable-infobars --password-store=basic --check-for-update-interval=31536000 "http://localhost:$PORT"
+$BROWSER --kiosk --noerrdialogs --disable-infobars --password-store=basic --check-for-update-interval=31536000 --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist --use-gl=egl "http://localhost:$PORT"
