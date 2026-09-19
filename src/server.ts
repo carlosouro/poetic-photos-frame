@@ -32,23 +32,35 @@ const UNFAVORITED_FOLDER_NAME = '_photoframe_unfavorited';
 const DUPLICATES_FOLDER_NAME = '_photoframe_duplicates';
 const ERROR_IMAGE_MARKER = 'SYSTEM_ERROR_IMAGE';
 
-// --- CACHE SETUP ---
+// --- CACHE & DB SETUP ---
 const CACHE_DIR = './cache';
-const PHOTOS_JSON_PATH = path.join(CACHE_DIR, 'photos.json');
-const TEXTS_JSON_PATH = path.join(CACHE_DIR, 'texts.json');
 
 // Boot-time sync directory creation is fine
 if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
-// --- DATA STRUCTURES ---
-interface Photo {
-    path: string;
-    created: string;
-    mediaType?: 'image' | 'video';
-    hash?: string;
-}
+import {
+    initDatabase,
+    getDbStats,
+    getPhotoCount,
+    insertPhotosBatch,
+    getPhotoByPath,
+    getPhotoByHash,
+    updatePhotoHash,
+    removePhoto,
+    renamePhoto,
+    selectSmartPhoto,
+    getRandomPhoto,
+    getRandomCachedQuotePhoto,
+    getQuote,
+    setQuote,
+    deleteQuote,
+    hasDuplicateQuote,
+    migrateQuote,
+    Photo,
+    QuoteEntry
+} from './db';
 
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
@@ -224,22 +236,8 @@ const getMediaFileSize = async (filePath: string): Promise<number | null> => {
     }
 };
 
-interface TextEntry {
-    content: string;
-    type: 'poem' | 'quote';
-    author: string | null;
-}
-
-let photoPaths = new Set<string>(); 
-let photoLibrary: Photo[] = [];
-let textLibrary: Record<string, TextEntry> = {};
-const hashToPath = new Map<string, string>();
-
-let isDirtyPhotos = false; 
 let isIndexing = false; 
 let isGeneratingAI = false;
-let isSavingPhotos = false;
-let isSavingTexts = false;
 
 // --- NAS CIRCUIT BREAKER ---
 let isNasOffline = false;
@@ -283,54 +281,6 @@ async function fileExists(pathStr: string): Promise<boolean> {
     }
 }
 
-// --- PERSISTENCE HELPERS ---
-
-const loadLibraries = () => {
-    try {
-        if (fs.existsSync(PHOTOS_JSON_PATH)) {
-            const data = fs.readFileSync(PHOTOS_JSON_PATH, 'utf-8');
-            photoLibrary = JSON.parse(data);
-            photoPaths = new Set(photoLibrary.map(p => p.path));
-            hashToPath.clear();
-            for (const p of photoLibrary) {
-                if (p.hash) {
-                    hashToPath.set(p.hash, p.path);
-                }
-            }
-            console.log(`📚 Photos loaded from cache: ${photoLibrary.length} (${hashToPath.size} indexed with hash)`);
-        }
-    } catch (e) { console.error("Error loading photos cache:", e); }
-
-    try {
-        if (fs.existsSync(TEXTS_JSON_PATH)) {
-            const data = fs.readFileSync(TEXTS_JSON_PATH, 'utf-8');
-            textLibrary = JSON.parse(data);
-            const totalQuotes = Object.values(textLibrary).filter(t => t.type === 'quote' && t.author).length;
-            console.log(`📜 Quotes loaded from cache: ${totalQuotes} (Total records: ${Object.keys(textLibrary).length})`);
-        }
-    } catch (e) { console.error("Error loading texts cache:", e); }
-};
-
-
-const savePhotosToDisk = async () => {
-    if (!isDirtyPhotos || isSavingPhotos) return;
-    isSavingPhotos = true;
-    try {
-        await fsPromises.writeFile(PHOTOS_JSON_PATH, JSON.stringify(photoLibrary, null, 2));
-        console.log(`💾 Persisted ${photoLibrary.length} photos to cache.`);
-        isDirtyPhotos = false;
-    } catch (e) { console.error("Error saving photos:", e); }
-    finally { isSavingPhotos = false; }
-};
-
-const saveTextsToDisk = async () => {
-    if (isSavingTexts) return;
-    isSavingTexts = true;
-    try {
-        await fsPromises.writeFile(TEXTS_JSON_PATH, JSON.stringify(textLibrary, null, 2));
-    } catch (e) { console.error("Error saving texts:", e); }
-    finally { isSavingTexts = false; }
-};
 
 // --- DUPLICATE DETECTION & AUTO-CURATION ENGINE ---
 
@@ -427,28 +377,9 @@ const quarantineDuplicate = async (duplicatePath: string, survivorPath: string):
 
         await fsPromises.rename(duplicatePath, targetFilePath);
 
-        // Update in-memory indexes
-        photoPaths.delete(duplicatePath);
-        photoLibrary = photoLibrary.filter(p => p.path !== duplicatePath);
-        isDirtyPhotos = true;
-
-        // If duplicate was tracked in hashToPath, remove or re-point
-        for (const [hashVal, p] of hashToPath.entries()) {
-            if (p === duplicatePath) {
-                hashToPath.set(hashVal, survivorPath);
-            }
-        }
-
-        // Migrate AI poem from duplicate to survivor if survivor lacks one
-        if (textLibrary[duplicatePath]) {
-            if (!textLibrary[survivorPath]) {
-                textLibrary[survivorPath] = textLibrary[duplicatePath];
-                console.log(`📝 Migrated AI poem to survivor: ${path.basename(survivorPath)}`);
-            }
-            delete textLibrary[duplicatePath];
-            isSavingTexts = false;
-            saveTextsToDisk();
-        }
+        // Remove duplicate from SQLite and migrate quote to survivor if survivor lacks one
+        removePhoto(duplicatePath);
+        migrateQuote(duplicatePath, survivorPath);
 
         console.log(`🗑️ Auto-quarantined duplicate: ${path.basename(duplicatePath)} -> ${DUPLICATES_FOLDER_NAME}/${relPath} (Surviving original: ${path.basename(survivorPath)})`);
         return true;
@@ -457,58 +388,6 @@ const quarantineDuplicate = async (duplicatePath: string, survivorPath: string):
         return false;
     }
 };
-
-// --- SMART PHOTO SELECTION ---
-
-
-function selectSmartPhoto(excludePath?: string | null): Photo | null {
-    if (photoLibrary.length === 0) return null;
-
-    const baseLibrary = excludePath && photoLibrary.length > 1
-        ? photoLibrary.filter(p => p.path !== excludePath)
-        : photoLibrary;
-
-    const now = new Date();
-    const msPerDay = 1000 * 60 * 60 * 24;
-
-    const favorites = baseLibrary.filter(p => p.path.includes(DEFAULTS_FOLDER_NAME));
-
-    const smartCandidates = baseLibrary.filter(photo => {
-        const pDate = new Date(photo.created);
-        if (isNaN(pDate.getTime())) return false;
-
-        const diffTime = now.getTime() - pDate.getTime();
-        const diffDays = diffTime / msPerDay;
-        if (diffDays >= 0 && diffDays <= 30) return true;
-
-        const pDateCurrentYear = new Date(pDate);
-        pDateCurrentYear.setFullYear(now.getFullYear());
-        
-        const timeDiff = Math.abs(now.getTime() - pDateCurrentYear.getTime());
-        const dayDiff = Math.ceil(timeDiff / msPerDay);
-
-        return dayDiff <= 10;
-    });
-
-    const roll = Math.random(); 
-
-    if (roll < 0.8) {
-        if (smartCandidates.length > 0) {
-            return smartCandidates[Math.floor(Math.random() * smartCandidates.length)];
-        }
-        if (favorites.length > 0) {
-            return favorites[Math.floor(Math.random() * favorites.length)];
-        }
-    } 
-    
-    if (roll < 0.9) {
-        if (favorites.length > 0) {
-            return favorites[Math.floor(Math.random() * favorites.length)];
-        }
-    }
-
-    return baseLibrary[Math.floor(Math.random() * baseLibrary.length)];
-}
 
 // --- INDEXING LOGIC ---
 
@@ -522,19 +401,7 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
 
         indexer.on('message', (msg: any) => {
             if (msg.type === 'batch' && Array.isArray(msg.photos)) {
-                let addedCount = 0;
-                msg.photos.forEach((p: Photo) => {
-                    if (!photoPaths.has(p.path)) {
-                        photoPaths.add(p.path);
-                        photoLibrary.push(p);
-                        if (p.hash) {
-                            hashToPath.set(p.hash, p.path);
-                        }
-                        addedCount++;
-                    }
-                });
-
-                if (addedCount > 0) isDirtyPhotos = true; 
+                insertPhotosBatch(msg.photos);
             }
         });
 
@@ -557,17 +424,18 @@ const performIndexing = async (clearCache: boolean = false) => {
     }
 
     isIndexing = true;
-    console.log(`🚀 Starting zero-downtime background indexing (preserving ${photoLibrary.length} active cached photos)...`);
+    const initialStats = getDbStats();
+    console.log(`🚀 Starting zero-downtime background indexing (preserving ${initialStats.totalPhotos} active cached photos)...`);
 
-    // ZERO-DOWNTIME: We DO NOT wipe photoLibrary so active memories keep serving without disruption!
     runIndexer('full')
         .then(() => {
-            savePhotosToDisk();
-            console.log(`✅ Indexing completed. Library size: ${photoLibrary.length} items.`);
+            const stats = getDbStats();
+            console.log(`✅ Indexing completed. Library size: ${stats.totalPhotos} items (${stats.indexedHashes} hashed, ${stats.favoritesCount} favorites).`);
         })
         .catch(err => console.error("❌ Background index failed:", err))
         .finally(() => isIndexing = false);
 };
+
 
 // --- LOG MAINTENANCE ---
 const trimLogFile = async (maxLines = 10000) => {
@@ -588,7 +456,6 @@ const trimLogFile = async (maxLines = 10000) => {
 };
 
 // --- SCHEDULING ---
-setInterval(() => savePhotosToDisk(), 30 * 1000);
 setInterval(() => {
     const now = new Date();
     if (now.getHours() === 2 && now.getMinutes() === 0) {
@@ -622,7 +489,7 @@ async function fileToGenerativePart(filePath: string, mimeType = "image/jpeg") {
     }
 }
 
-async function generateWithRetry(prompt: string, imagePart: { data: string; mimeType: string }, retries = 3, delay = 1000): Promise<TextEntry> {
+async function generateWithRetry(prompt: string, imagePart: { data: string; mimeType: string }, retries = 3, delay = 1000): Promise<QuoteEntry> {
     try {
         // Enforce a strict 20-second timeout on Gemini API calls so network drops don't hang the app forever
         const timeoutPromise = new Promise<never>((_, reject) => 
@@ -659,7 +526,7 @@ async function generateWithRetry(prompt: string, imagePart: { data: string; mime
             ? result.text()
             : (typeof result.text === 'string' ? result.text : (result.candidates?.[0]?.content?.parts?.[0]?.text || ''));
         const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-        const parsed = JSON.parse(cleanText) as TextEntry;
+        const parsed = JSON.parse(cleanText) as QuoteEntry;
         return parsed;
     } catch (error: any) {
         if (error.message?.includes('404')) throw error;
@@ -693,7 +560,7 @@ app.get('/api/next-memory', async (req, res) => {
             }
         }
 
-        if (photoLibrary.length === 0) {
+        if (getPhotoCount() === 0) {
             return res.json({
                 text: "Loading memories from storage...",
                 type: 'quote',
@@ -710,15 +577,13 @@ app.get('/api/next-memory', async (req, res) => {
         const currentPath = req.query.current ? decodeURIComponent(req.query.current as string) : null;
         let selectedPhoto: Photo | null = null;
         for (let attempt = 0; attempt < 10; attempt++) {
-            const candidate = selectSmartPhoto(currentPath) || (currentPath ? photoLibrary.find(p => p.path !== currentPath) : null) || photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
+            const candidate = selectSmartPhoto(currentPath || undefined) || (currentPath ? getRandomPhoto(currentPath) : null) || getRandomPhoto();
             if (!candidate) break;
 
             const size = await getMediaFileSize(candidate.path);
             if (size === null || size <= 0) {
                 if (!isNasOffline) {
-                    photoLibrary = photoLibrary.filter(p => p.path !== candidate.path);
-                    photoPaths.delete(candidate.path);
-                    isDirtyPhotos = true;
+                    removePhoto(candidate.path);
                 }
                 continue;
             }
@@ -735,23 +600,22 @@ app.get('/api/next-memory', async (req, res) => {
             if (!hash) {
                 try {
                     hash = await computeFileSha256(candidate.path);
+                    updatePhotoHash(candidate.path, hash);
                     candidate.hash = hash;
-                    isDirtyPhotos = true;
                 } catch (hashErr) {
                     console.warn(`⚠️ Could not compute hash for ${path.basename(candidate.path)}:`, hashErr);
                 }
             }
 
             if (hash) {
-                const existingPath = hashToPath.get(hash);
-                if (existingPath && existingPath !== candidate.path && photoPaths.has(existingPath)) {
+                const existingCandidate = getPhotoByHash(hash, candidate.path);
+                if (existingCandidate) {
                     // Hash collision detected! Determine survivor
-                    const existingCandidate = photoLibrary.find(p => p.path === existingPath);
                     const { survivor, duplicate } = determineSurvivor(
                         candidate.path,
-                        existingPath,
+                        existingCandidate.path,
                         candidate.created,
-                        existingCandidate?.created
+                        existingCandidate.created
                     );
 
                     if (duplicate === candidate.path) {
@@ -760,11 +624,9 @@ app.get('/api/next-memory', async (req, res) => {
                         continue;
                     } else {
                         // Existing file was the duplicate -> quarantine it, candidate survives
-                        await quarantineDuplicate(existingPath, candidate.path);
-                        hashToPath.set(hash, candidate.path);
+                        await quarantineDuplicate(existingCandidate.path, candidate.path);
+                        updatePhotoHash(candidate.path, hash);
                     }
-                } else {
-                    hashToPath.set(hash, candidate.path);
                 }
             }
 
@@ -810,29 +672,19 @@ app.get('/api/next-memory', async (req, res) => {
         }
 
 
-        let aiResponse: TextEntry | null = null;
+        let aiResponse: QuoteEntry | null = null;
         let duplicateDetected = false;
         let textToExclude = "";
 
         // 2. CHECK CACHE & DETECT DUPLICATES
-        if (textLibrary[selectedPhoto.path]) {
-            const cachedEntry = textLibrary[selectedPhoto.path];
-
-            // Only accept genuine quotes with an author; discard legacy poems
-            if (cachedEntry.type === 'quote' && cachedEntry.author) {
-                aiResponse = cachedEntry;
-                
-                for (const [otherPath, entry] of Object.entries(textLibrary)) {
-                    if (otherPath !== selectedPhoto.path && entry.content === aiResponse.content) {
-                        duplicateDetected = true;
-                        textToExclude = aiResponse.content;
-                        console.log(`♻️  Duplicate quote content detected for ${path.basename(selectedPhoto.path)}. Refreshing...`);
-                        break;
-                    }
-                }
+        const cachedEntry = getQuote(selectedPhoto.path);
+        if (cachedEntry) {
+            if (hasDuplicateQuote(cachedEntry.content, selectedPhoto.path)) {
+                duplicateDetected = true;
+                textToExclude = cachedEntry.content;
+                console.log(`♻️  Duplicate quote content detected for ${path.basename(selectedPhoto.path)}. Refreshing...`);
             } else {
-                delete textLibrary[selectedPhoto.path];
-                saveTextsToDisk();
+                aiResponse = cachedEntry;
             }
         }
 
@@ -841,12 +693,10 @@ app.get('/api/next-memory', async (req, res) => {
             
             if (isGeneratingAI) {
                 console.log("⚠️ Backend is busy. Forcing a cached fallback quote memory.");
-                const cachedPaths = Object.keys(textLibrary).filter(p => textLibrary[p]?.type === 'quote' && textLibrary[p]?.author);
-                const availableCachedPhotos = photoLibrary.filter(p => cachedPaths.includes(p.path) && (!currentPath || p.path !== currentPath));
-                
-                if (availableCachedPhotos.length > 0) {
-                    selectedPhoto = availableCachedPhotos[Math.floor(Math.random() * availableCachedPhotos.length)];
-                    aiResponse = textLibrary[selectedPhoto.path];
+                const availableCachedPhoto = getRandomCachedQuotePhoto(currentPath || undefined);
+                if (availableCachedPhoto) {
+                    selectedPhoto = availableCachedPhoto;
+                    aiResponse = getQuote(selectedPhoto.path) || { content: "A vida é feita de momentos que o tempo eterniza.", type: "quote", author: "Fernando Pessoa" };
                 } else {
                     aiResponse = { content: "A vida é feita de momentos que o tempo eterniza.", type: "quote", author: "Fernando Pessoa" };
                 }
@@ -885,9 +735,9 @@ app.get('/api/next-memory', async (req, res) => {
                 try {
                     const imagePart = await fileToGenerativePart(selectedPhoto.path, "image/jpeg");
                     aiResponse = await generateWithRetry(prompt, imagePart);
-                    
-                    textLibrary[selectedPhoto.path] = aiResponse;
-                    saveTextsToDisk(); 
+                    if (aiResponse) {
+                        setQuote(selectedPhoto.path, aiResponse);
+                    }
                 } catch (aiError) {
                     console.error("Gemini Final Error:", aiError);
                     if (!aiResponse) {
@@ -1005,26 +855,7 @@ app.post('/api/favorite', async (req, res) => {
         }
 
         await fsPromises.rename(currentPath, newPath);
-
-        const photoEntry = photoLibrary.find(p => p.path === currentPath);
-        if (photoEntry) {
-            photoEntry.path = newPath;
-            if (photoEntry.hash) {
-                hashToPath.set(photoEntry.hash, newPath);
-            }
-        }
-        
-        photoPaths.delete(currentPath);
-        photoPaths.add(newPath);
-
-        if (textLibrary[currentPath]) {
-            textLibrary[newPath] = textLibrary[currentPath];
-            delete textLibrary[currentPath];
-            saveTextsToDisk();
-        }
-
-        isDirtyPhotos = true;
-        savePhotosToDisk();
+        renamePhoto(currentPath, newPath);
 
         const isNowFavorite = !isCurrentlyFavorite;
         res.json({ success: true, newPath, isFavorite: isNowFavorite });
@@ -1059,20 +890,7 @@ app.post('/api/omit', async (req, res) => {
         }
 
         await fsPromises.rename(currentPath, newPath);
-
-        photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
-        photoPaths.delete(currentPath);
-        for (const [h, p] of hashToPath.entries()) {
-            if (p === currentPath) hashToPath.delete(h);
-        }
-
-        if (textLibrary[currentPath]) {
-            delete textLibrary[currentPath];
-            saveTextsToDisk();
-        }
-
-        isDirtyPhotos = true;
-        savePhotosToDisk();
+        removePhoto(currentPath);
 
         res.json({ success: true, newPath });
     } catch(e: any) {
@@ -1087,20 +905,7 @@ app.delete('/api/photo', async (req, res) => {
         if (!currentPath || !(await fileExists(currentPath))) return res.status(404).json({error: "File not found"});
 
         await fsPromises.unlink(currentPath);
-
-        photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
-        photoPaths.delete(currentPath);
-        for (const [h, p] of hashToPath.entries()) {
-            if (p === currentPath) hashToPath.delete(h);
-        }
-        
-        if (textLibrary[currentPath]) {
-            delete textLibrary[currentPath];
-            saveTextsToDisk();
-        }
-
-        isDirtyPhotos = true;
-        savePhotosToDisk();
+        removePhoto(currentPath);
 
         res.json({ success: true });
     } catch(e: any) {
@@ -1130,11 +935,12 @@ app.get('/api/duplicates', async (req, res) => {
             count = await countFiles(duplicatesDir);
         }
 
+        const stats = getDbStats();
         res.json({
             duplicatesFolder: duplicatesDir,
             quarantinedCount: count,
-            indexedHashesCount: hashToPath.size,
-            totalPhotosInLibrary: photoLibrary.length
+            indexedHashesCount: stats.indexedHashes,
+            totalPhotosInLibrary: stats.totalPhotos
         });
     } catch (err: any) {
         res.status(500).json({ error: err.message });
@@ -1156,6 +962,8 @@ app.post('/api/reindex', (req, res) => {
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    loadLibraries();
-    if (photoLibrary.length === 0) performIndexing(false);
+    initDatabase();
+    const stats = getDbStats();
+    console.log(`📚 Database ready: ${stats.totalPhotos} photos (${stats.indexedHashes} hashed, ${stats.favoritesCount} favorites) | 📜 ${stats.totalQuotes} quotes`);
+    if (stats.totalPhotos === 0) performIndexing(false);
 });
