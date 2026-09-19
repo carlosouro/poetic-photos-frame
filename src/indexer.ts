@@ -20,6 +20,8 @@ if (process.platform === 'linux') {
 const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH || './test-photos'; 
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
 const OMITTED_FOLDER_NAME = '_photoframe_omitted';
+const DUPLICATES_FOLDER_NAME = '_photoframe_duplicates';
+const UNFAVORITED_FOLDER_NAME = '_photoframe_unfavorited';
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp']);
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
 const ALL_MEDIA_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS]);
@@ -35,7 +37,9 @@ interface Photo {
     path: string;
     created: string;
     mediaType?: 'image' | 'video';
+    hash?: string;
 }
+
 
 const args = process.argv.slice(2);
 const isDefaultsMode = args.includes('--mode=defaults');
@@ -74,8 +78,9 @@ async function scanDirectory(dir: string, batchBuffer: Photo[]) {
         const files = rawEntries.sort().reverse();
 
         for (const file of files) {
-            // Skip hidden files, Synology thumbnails (@eaDir), OR the OMITTED folder
-            if (file.startsWith('.') || file.startsWith('@') || file === OMITTED_FOLDER_NAME) continue;
+            // Skip hidden files, Synology thumbnails (@eaDir), OMITTED folder, DUPLICATES folder, OR UNFAVORITED folder
+            if (file.startsWith('.') || file.startsWith('@') || file === OMITTED_FOLDER_NAME || file === DUPLICATES_FOLDER_NAME || file === UNFAVORITED_FOLDER_NAME) continue;
+
 
             const filePath = path.join(dir, file);
             let stat;

@@ -29,6 +29,7 @@ const NAS_ROOT_PATH = process.env.NAS_ROOT_PATH;
 const DEFAULTS_FOLDER_NAME = '_photoframe_defaults';
 const OMITTED_FOLDER_NAME = '_photoframe_omitted';
 const UNFAVORITED_FOLDER_NAME = '_photoframe_unfavorited';
+const DUPLICATES_FOLDER_NAME = '_photoframe_duplicates';
 const ERROR_IMAGE_MARKER = 'SYSTEM_ERROR_IMAGE';
 
 // --- CACHE SETUP ---
@@ -46,7 +47,9 @@ interface Photo {
     path: string;
     created: string;
     mediaType?: 'image' | 'video';
+    hash?: string;
 }
+
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
 const isVideoFile = (filePath: string): boolean => {
@@ -230,6 +233,7 @@ interface TextEntry {
 let photoPaths = new Set<string>(); 
 let photoLibrary: Photo[] = [];
 let textLibrary: Record<string, TextEntry> = {};
+const hashToPath = new Map<string, string>();
 
 let isDirtyPhotos = false; 
 let isIndexing = false; 
@@ -287,7 +291,13 @@ const loadLibraries = () => {
             const data = fs.readFileSync(PHOTOS_JSON_PATH, 'utf-8');
             photoLibrary = JSON.parse(data);
             photoPaths = new Set(photoLibrary.map(p => p.path));
-            console.log(`📚 Photos loaded from cache: ${photoLibrary.length}`);
+            hashToPath.clear();
+            for (const p of photoLibrary) {
+                if (p.hash) {
+                    hashToPath.set(p.hash, p.path);
+                }
+            }
+            console.log(`📚 Photos loaded from cache: ${photoLibrary.length} (${hashToPath.size} indexed with hash)`);
         }
     } catch (e) { console.error("Error loading photos cache:", e); }
 
@@ -299,6 +309,7 @@ const loadLibraries = () => {
         }
     } catch (e) { console.error("Error loading texts cache:", e); }
 };
+
 
 const savePhotosToDisk = async () => {
     if (!isDirtyPhotos || isSavingPhotos) return;
@@ -320,7 +331,134 @@ const saveTextsToDisk = async () => {
     finally { isSavingTexts = false; }
 };
 
+// --- DUPLICATE DETECTION & AUTO-CURATION ENGINE ---
+
+const computeFileSha256 = (filePath: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const hash = crypto.createHash('sha256');
+        const stream = fs.createReadStream(filePath);
+        stream.on('data', (chunk) => hash.update(chunk));
+        stream.on('end', () => resolve(hash.digest('hex')));
+        stream.on('error', (err) => reject(err));
+    });
+};
+
+const scorePathForSurvival = (filePath: string): number => {
+    let score = 0;
+    const base = path.basename(filePath);
+    const lowerPath = filePath.toLowerCase();
+
+    // 1. Favorites folder always takes absolute priority
+    if (filePath.includes(DEFAULTS_FOLDER_NAME)) {
+        score += 10000;
+    }
+
+    // 2. Filename Cleanliness: penalize copy/duplicate suffixes (e.g. " (1)", "_1", " - Copy", "copy")
+    const dupSuffixRegex = /([_\s-](copy|\(\d+\)|\d{1,2}))\.[a-z0-9]+$/i;
+    if (dupSuffixRegex.test(base)) {
+        score -= 500;
+    }
+
+    // 3. Folder Organization: penalize generic dump/backup/messenger folders
+    const dumpFolderRegex = /\/(mobilebackup|downloads|whatsapp|staging|temp|tmp|camera\s*roll)\//i;
+    if (dumpFolderRegex.test(lowerPath)) {
+        score -= 200;
+    }
+
+    // 4. Shorter directory depth indicates more curated placement
+    const depth = filePath.split(path.sep).length;
+    score -= depth * 5;
+
+    return score;
+};
+
+const determineSurvivor = (
+    pathA: string,
+    pathB: string,
+    createdA?: string,
+    createdB?: string
+): { survivor: string; duplicate: string } => {
+    const scoreA = scorePathForSurvival(pathA);
+    const scoreB = scorePathForSurvival(pathB);
+
+    if (scoreA !== scoreB) {
+        return scoreA > scoreB
+            ? { survivor: pathA, duplicate: pathB }
+            : { survivor: pathB, duplicate: pathA };
+    }
+
+    // Tie-breaker: Earliest timestamp
+    if (createdA && createdB) {
+        const timeA = new Date(createdA).getTime();
+        const timeB = new Date(createdB).getTime();
+        if (!isNaN(timeA) && !isNaN(timeB) && timeA !== timeB) {
+            return timeA < timeB
+                ? { survivor: pathA, duplicate: pathB }
+                : { survivor: pathB, duplicate: pathA };
+        }
+    }
+
+    // Alphabetical tie-breaker
+    return pathA.localeCompare(pathB) <= 0
+        ? { survivor: pathA, duplicate: pathB }
+        : { survivor: pathB, duplicate: pathA };
+};
+
+const quarantineDuplicate = async (duplicatePath: string, survivorPath: string): Promise<boolean> => {
+    try {
+        if (!NAS_ROOT_PATH) return false;
+
+        // Calculate relative path preserving folder hierarchy
+        let relPath = path.relative(NAS_ROOT_PATH, duplicatePath);
+        if (relPath.startsWith('..') || path.isAbsolute(relPath)) {
+            relPath = path.basename(duplicatePath);
+        }
+
+        const targetDir = path.join(NAS_ROOT_PATH, DUPLICATES_FOLDER_NAME, path.dirname(relPath));
+        await fsPromises.mkdir(targetDir, { recursive: true });
+
+        let targetFilePath = path.join(targetDir, path.basename(relPath));
+        if (await fileExists(targetFilePath)) {
+            const ext = path.extname(targetFilePath);
+            const base = path.basename(targetFilePath, ext);
+            targetFilePath = path.join(targetDir, `${base}_${Date.now()}${ext}`);
+        }
+
+        await fsPromises.rename(duplicatePath, targetFilePath);
+
+        // Update in-memory indexes
+        photoPaths.delete(duplicatePath);
+        photoLibrary = photoLibrary.filter(p => p.path !== duplicatePath);
+        isDirtyPhotos = true;
+
+        // If duplicate was tracked in hashToPath, remove or re-point
+        for (const [hashVal, p] of hashToPath.entries()) {
+            if (p === duplicatePath) {
+                hashToPath.set(hashVal, survivorPath);
+            }
+        }
+
+        // Migrate AI poem from duplicate to survivor if survivor lacks one
+        if (textLibrary[duplicatePath]) {
+            if (!textLibrary[survivorPath]) {
+                textLibrary[survivorPath] = textLibrary[duplicatePath];
+                console.log(`📝 Migrated AI poem to survivor: ${path.basename(survivorPath)}`);
+            }
+            delete textLibrary[duplicatePath];
+            isSavingTexts = false;
+            saveTextsToDisk();
+        }
+
+        console.log(`🗑️ Auto-quarantined duplicate: ${path.basename(duplicatePath)} -> ${DUPLICATES_FOLDER_NAME}/${relPath} (Surviving original: ${path.basename(survivorPath)})`);
+        return true;
+    } catch (err) {
+        console.error(`❌ Failed to quarantine duplicate ${path.basename(duplicatePath)}:`, err);
+        return false;
+    }
+};
+
 // --- SMART PHOTO SELECTION ---
+
 
 function selectSmartPhoto(excludePath?: string | null): Photo | null {
     if (photoLibrary.length === 0) return null;
@@ -388,9 +526,13 @@ const runIndexer = (mode: 'defaults' | 'full'): Promise<void> => {
                     if (!photoPaths.has(p.path)) {
                         photoPaths.add(p.path);
                         photoLibrary.push(p);
+                        if (p.hash) {
+                            hashToPath.set(p.hash, p.path);
+                        }
                         addedCount++;
                     }
                 });
+
                 if (addedCount > 0) isDirtyPhotos = true; 
             }
         });
@@ -563,10 +705,10 @@ app.get('/api/next-memory', async (req, res) => {
             });
         }
 
-        // 1. SELECT VALID MEDIA CANDIDATE WITHIN SIZE LIMITS
+        // 1. SELECT VALID MEDIA CANDIDATE WITHIN SIZE LIMITS & DEDUPLICATE ON-THE-FLY
         const currentPath = req.query.current ? decodeURIComponent(req.query.current as string) : null;
         let selectedPhoto: Photo | null = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
+        for (let attempt = 0; attempt < 10; attempt++) {
             const candidate = selectSmartPhoto(currentPath) || (currentPath ? photoLibrary.find(p => p.path !== currentPath) : null) || photoLibrary[Math.floor(Math.random() * photoLibrary.length)];
             if (!candidate) break;
 
@@ -587,9 +729,48 @@ app.get('/api/next-memory', async (req, res) => {
                 continue;
             }
 
+            // --- ON-THE-FLY DUPLICATE DETECTION & AUTO-CURATION ---
+            let hash = candidate.hash;
+            if (!hash) {
+                try {
+                    hash = await computeFileSha256(candidate.path);
+                    candidate.hash = hash;
+                    isDirtyPhotos = true;
+                } catch (hashErr) {
+                    console.warn(`⚠️ Could not compute hash for ${path.basename(candidate.path)}:`, hashErr);
+                }
+            }
+
+            if (hash) {
+                const existingPath = hashToPath.get(hash);
+                if (existingPath && existingPath !== candidate.path && photoPaths.has(existingPath)) {
+                    // Hash collision detected! Determine survivor
+                    const existingCandidate = photoLibrary.find(p => p.path === existingPath);
+                    const { survivor, duplicate } = determineSurvivor(
+                        candidate.path,
+                        existingPath,
+                        candidate.created,
+                        existingCandidate?.created
+                    );
+
+                    if (duplicate === candidate.path) {
+                        // Candidate is the duplicate -> quarantine and continue searching
+                        await quarantineDuplicate(candidate.path, survivor);
+                        continue;
+                    } else {
+                        // Existing file was the duplicate -> quarantine it, candidate survives
+                        await quarantineDuplicate(existingPath, candidate.path);
+                        hashToPath.set(hash, candidate.path);
+                    }
+                } else {
+                    hashToPath.set(hash, candidate.path);
+                }
+            }
+
             selectedPhoto = candidate;
             break;
         }
+
 
         if (!selectedPhoto) {
             return res.json({
@@ -821,7 +1002,12 @@ app.post('/api/favorite', async (req, res) => {
         await fsPromises.rename(currentPath, newPath);
 
         const photoEntry = photoLibrary.find(p => p.path === currentPath);
-        if (photoEntry) photoEntry.path = newPath;
+        if (photoEntry) {
+            photoEntry.path = newPath;
+            if (photoEntry.hash) {
+                hashToPath.set(photoEntry.hash, newPath);
+            }
+        }
         
         photoPaths.delete(currentPath);
         photoPaths.add(newPath);
@@ -871,6 +1057,9 @@ app.post('/api/omit', async (req, res) => {
 
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
+        for (const [h, p] of hashToPath.entries()) {
+            if (p === currentPath) hashToPath.delete(h);
+        }
 
         if (textLibrary[currentPath]) {
             delete textLibrary[currentPath];
@@ -896,6 +1085,9 @@ app.delete('/api/photo', async (req, res) => {
 
         photoLibrary = photoLibrary.filter(p => p.path !== currentPath);
         photoPaths.delete(currentPath);
+        for (const [h, p] of hashToPath.entries()) {
+            if (p === currentPath) hashToPath.delete(h);
+        }
         
         if (textLibrary[currentPath]) {
             delete textLibrary[currentPath];
@@ -912,7 +1104,40 @@ app.delete('/api/photo', async (req, res) => {
     }
 });
 
+app.get('/api/duplicates', async (req, res) => {
+    try {
+        if (!NAS_ROOT_PATH) return res.status(500).json({ error: "NAS Root not configured" });
+        const duplicatesDir = path.join(NAS_ROOT_PATH, DUPLICATES_FOLDER_NAME);
+        let count = 0;
+        if (await fileExists(duplicatesDir)) {
+            const countFiles = async (dir: string): Promise<number> => {
+                let total = 0;
+                try {
+                    const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+                    for (const entry of entries) {
+                        const full = path.join(dir, entry.name);
+                        if (entry.isDirectory()) total += await countFiles(full);
+                        else total++;
+                    }
+                } catch {}
+                return total;
+            };
+            count = await countFiles(duplicatesDir);
+        }
+
+        res.json({
+            duplicatesFolder: duplicatesDir,
+            quarantinedCount: count,
+            indexedHashesCount: hashToPath.size,
+            totalPhotosInLibrary: photoLibrary.length
+        });
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.post('/api/exit', (req, res) => {
+
     res.json({ message: 'Shutting down...' });
     exec('killall chromium-browser', () => {}); 
     exec('killall chromium', () => {});
