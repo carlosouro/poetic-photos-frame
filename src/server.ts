@@ -305,7 +305,8 @@ const loadLibraries = () => {
         if (fs.existsSync(TEXTS_JSON_PATH)) {
             const data = fs.readFileSync(TEXTS_JSON_PATH, 'utf-8');
             textLibrary = JSON.parse(data);
-            console.log(`📜 Texts loaded from cache: ${Object.keys(textLibrary).length}`);
+            const totalQuotes = Object.values(textLibrary).filter(t => t.type === 'quote' && t.author).length;
+            console.log(`📜 Quotes loaded from cache: ${totalQuotes} (Total records: ${Object.keys(textLibrary).length})`);
         }
     } catch (e) { console.error("Error loading texts cache:", e); }
 };
@@ -644,11 +645,11 @@ async function generateWithRetry(prompt: string, imagePart: { data: string; mime
                 responseSchema: {
                     type: 'OBJECT',
                     properties: {
-                        content: { type: 'STRING', description: 'A short 2-4 line poem or profound quote matching the photo' },
-                        type: { type: 'STRING', enum: ['quote', 'poem'], description: 'Whether the text is a quote or a poem' },
-                        author: { type: 'STRING', nullable: true, description: 'Author name if quote, null if poem' }
+                        content: { type: 'STRING', description: 'A meaningful, profound quote matching the photo. Can be well-known/famous, or a lesser-known quote if it better fits the scene and emotional resonance.' },
+                        type: { type: 'STRING', enum: ['quote'], description: 'Must always be quote' },
+                        author: { type: 'STRING', description: 'The author, thinker, poet, writer, philosopher, or figure who said/wrote the quote. If the author is unknown or of traditional/folk origin, use Anonymous, Unknown, or Popular wisdom (or Provérbio Popular / Anónimo in PT). Never null.' }
                     },
-                    required: ['content', 'type']
+                    required: ['content', 'type', 'author']
                 }
             } as any
         });
@@ -815,15 +816,23 @@ app.get('/api/next-memory', async (req, res) => {
 
         // 2. CHECK CACHE & DETECT DUPLICATES
         if (textLibrary[selectedPhoto.path]) {
-            aiResponse = textLibrary[selectedPhoto.path];
-            
-            for (const [otherPath, entry] of Object.entries(textLibrary)) {
-                if (otherPath !== selectedPhoto.path && entry.content === aiResponse.content) {
-                    duplicateDetected = true;
-                    textToExclude = aiResponse.content;
-                    console.log(`♻️  Duplicate content detected for ${path.basename(selectedPhoto.path)}. Refreshing...`);
-                    break;
+            const cachedEntry = textLibrary[selectedPhoto.path];
+
+            // Only accept genuine quotes with an author; discard legacy poems
+            if (cachedEntry.type === 'quote' && cachedEntry.author) {
+                aiResponse = cachedEntry;
+                
+                for (const [otherPath, entry] of Object.entries(textLibrary)) {
+                    if (otherPath !== selectedPhoto.path && entry.content === aiResponse.content) {
+                        duplicateDetected = true;
+                        textToExclude = aiResponse.content;
+                        console.log(`♻️  Duplicate quote content detected for ${path.basename(selectedPhoto.path)}. Refreshing...`);
+                        break;
+                    }
                 }
+            } else {
+                delete textLibrary[selectedPhoto.path];
+                saveTextsToDisk();
             }
         }
 
@@ -831,25 +840,22 @@ app.get('/api/next-memory', async (req, res) => {
         if (!aiResponse || duplicateDetected) {
             
             if (isGeneratingAI) {
-                console.log("⚠️ Backend is busy. Forcing a cached fallback memory.");
-                const cachedPaths = Object.keys(textLibrary);
+                console.log("⚠️ Backend is busy. Forcing a cached fallback quote memory.");
+                const cachedPaths = Object.keys(textLibrary).filter(p => textLibrary[p]?.type === 'quote' && textLibrary[p]?.author);
                 const availableCachedPhotos = photoLibrary.filter(p => cachedPaths.includes(p.path) && (!currentPath || p.path !== currentPath));
                 
                 if (availableCachedPhotos.length > 0) {
                     selectedPhoto = availableCachedPhotos[Math.floor(Math.random() * availableCachedPhotos.length)];
                     aiResponse = textLibrary[selectedPhoto.path];
                 } else {
-                    aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                    aiResponse = { content: "A vida é feita de momentos que o tempo eterniza.", type: "quote", author: "Fernando Pessoa" };
                 }
             } else {
                 isGeneratingAI = true; 
                 
-                const roll = Math.random();
-                const preferredType = roll < 0.3 ? "poem" : "quote";
-                
                 let exclusionInstruction = "";
                 if (duplicateDetected && textToExclude) {
-                    exclusionInstruction = `IMPORTANT: The following text was already used. Do NOT use it again: "${textToExclude}". Find something different.`;
+                    exclusionInstruction = `IMPORTANT: The following quote was already used. Do NOT use it again: "${textToExclude}". Find a completely different quote.`;
                 }
 
                 const photoDate = new Date(selectedPhoto.created);
@@ -861,20 +867,19 @@ app.get('/api/next-memory', async (req, res) => {
                 }
 
                 const prompt = `
-                    You are a poetic assistant for a digital photo frame. Look at this image.
+                    You are a literary curator for a digital photo frame. Look closely at this image.
                     
-                    Goal: Generate text that matches the mood, location, and emotional resonance of the photo.
+                    Goal: Select a profound, meaningful, and poignant existing quote that reflects the scene, mood, location, activity, or emotional resonance of the photo.
                     ${temporalContext ? `${temporalContext}\n` : ''}
-                    Preference: I am leaning towards a **${preferredType.toUpperCase()}** for this specific image. 
-                    However, please override this preference if the image content clearly suits the other format much better.
                     
                     ${exclusionInstruction}
 
-                    Definitions:
-                    - Quote: A profound, existing famous quote.
-                    - Poem: A short, beautiful poem (max 4 lines).
-                    
-                    Language: Randomly choose between Portuguese (European - PT-PT) or English.
+                    Directives:
+                    - Only real, authentic, existing quotes. Can be a widely famous quote, or a lesser-known quote if it captures the moment and emotional mood better.
+                    - DO NOT compose your own poem, rhymes, or AI-generated prose.
+                    - Provide the author in the 'author' field (e.g. Fernando Pessoa, Oscar Wilde, Albert Einstein, Sophia de Mello Breyner Andresen, Victor Hugo, Ralph Waldo Emerson, Clarice Lispector, etc.).
+                    - If the quote is of unknown origin or traditional/folk wisdom, set author to "Anonymous", "Unknown", "Proverb", or "Provérbio Popular" / "Anónimo".
+                    - Language: Randomly choose between European Portuguese (PT-PT) or English. If European Portuguese, quotes from Portuguese or Lusophone writers or well-known translated quotes/proverbs are welcomed.
                 `;
 
                 try {
@@ -886,7 +891,7 @@ app.get('/api/next-memory', async (req, res) => {
                 } catch (aiError) {
                     console.error("Gemini Final Error:", aiError);
                     if (!aiResponse) {
-                        aiResponse = { content: "Memories are timeless treasures.", type: "poem", author: null };
+                        aiResponse = { content: "O valor das coisas não está no tempo que elas duram, mas na intensidade com que acontecem.", type: "quote", author: "Fernando Pessoa" };
                     }
                 } finally {
                     isGeneratingAI = false; 
