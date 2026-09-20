@@ -20,14 +20,38 @@
 
         #app { position: relative; width: 100vw; height: 100vh; }
 
-        /* PHOTO LAYER */
+        /* PHOTO & VIDEO MEDIA LAYERS */
         #photo-container {
-            width: 100%; height: 100%; display: flex;
-            justify-content: center; align-items: center; background: #000;
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: #000;
+            overflow: hidden;
         }
-        #main-photo, #main-video {
-            max-width: 100%; max-height: 100%; object-fit: contain; 
-            opacity: 0; transition: opacity 1.5s ease-in-out;
+        .media-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            transition: opacity 1.2s ease-in-out;
+            pointer-events: none;
+            z-index: 1;
+        }
+        .media-layer.active {
+            opacity: 1;
+            z-index: 2;
+        }
+        .layer-photo, .layer-video {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
         }
 
         /* TEXT OVERLAY */
@@ -70,6 +94,55 @@
         #video-indicator.visible { opacity: 1; }
         #video-status-icon { font-size: 0.75rem; color: #4cd137; }
         #video-time-text { font-variant-numeric: tabular-nums; }
+
+        /* TOP LEFT WEATHER WIDGET */
+        #weather-widget {
+            position: absolute; top: 30px; left: 30px; z-index: 60;
+            display: flex; align-items: center; gap: 10px;
+            background: rgba(0, 0, 0, 0.45);
+            padding: 6px 12px; border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            font-family: 'Montserrat', sans-serif;
+            color: #fff;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 1s ease-in-out;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+        #weather-widget.visible { opacity: 0.85; }
+
+        .weather-col {
+            display: flex; flex-direction: column; align-items: center;
+            min-width: 36px; text-align: center;
+        }
+        .weather-header {
+            display: flex; flex-direction: column; align-items: center;
+            line-height: 1.1; margin-bottom: 2px;
+        }
+        .weather-time {
+            font-size: 0.72rem; font-weight: 600; letter-spacing: 0.5px; color: #eee;
+        }
+        .weather-day {
+            font-size: 0.52rem; font-weight: 400; text-transform: uppercase;
+            letter-spacing: 0.8px; color: #aaa;
+        }
+        .weather-icon {
+            width: 20px; height: 20px; display: flex; align-items: center;
+            justify-content: center; margin: 2px 0;
+        }
+        .weather-icon svg {
+            width: 100%; height: 100%; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));
+        }
+        .weather-temp {
+            font-size: 0.92rem; font-weight: 600; color: #fff;
+            letter-spacing: 0.5px; font-variant-numeric: tabular-nums;
+            text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+        }
+        .weather-divider {
+            width: 1px; height: 34px; background: rgba(255, 255, 255, 0.15);
+        }
 
         /* TOP RIGHT HEART ICON */
         #quick-fav {
@@ -165,8 +238,14 @@
         </div>
         
         <div id="photo-container">
-            <img id="main-photo" src="" alt="Memory">
-            <video id="main-video" playsinline muted style="display: none;"></video>
+            <div class="media-layer" id="layer-0">
+                <img class="layer-photo" src="" alt="Memory">
+                <video class="layer-video" playsinline muted style="display: none;"></video>
+            </div>
+            <div class="media-layer" id="layer-1">
+                <img class="layer-photo" src="" alt="Memory">
+                <video class="layer-video" playsinline muted style="display: none;"></video>
+            </div>
         </div>
 
         <div id="text-overlay">
@@ -179,6 +258,26 @@
                 <span id="video-time-text">0:00 / 0:00</span>
             </div>
             <div id="date-display"></div>
+        </div>
+ 
+        <div id="weather-widget">
+            <div class="weather-col" id="weather-slot-a">
+                <div class="weather-header">
+                    <span class="weather-time" id="weather-time-a">8am</span>
+                    <span class="weather-day" id="weather-day-a">--</span>
+                </div>
+                <div class="weather-icon" id="weather-icon-a"></div>
+                <div class="weather-temp" id="weather-temp-a">--</div>
+            </div>
+            <div class="weather-divider"></div>
+            <div class="weather-col" id="weather-slot-b">
+                <div class="weather-header">
+                    <span class="weather-time" id="weather-time-b">4pm</span>
+                    <span class="weather-day" id="weather-day-b">--</span>
+                </div>
+                <div class="weather-icon" id="weather-icon-b"></div>
+                <div class="weather-temp" id="weather-temp-b">--</div>
+            </div>
         </div>
 
         <div id="quick-fav">
@@ -241,8 +340,24 @@
         let historyStack = []; 
         let isProcessing = false;
 
-        const photoEl = document.getElementById('main-photo');
-        const videoEl = document.getElementById('main-video');
+        const layers = [
+            {
+                container: document.getElementById('layer-0'),
+                photo: document.querySelector('#layer-0 .layer-photo'),
+                video: document.querySelector('#layer-0 .layer-video')
+            },
+            {
+                container: document.getElementById('layer-1'),
+                photo: document.querySelector('#layer-1 .layer-photo'),
+                video: document.querySelector('#layer-1 .layer-video')
+            }
+        ];
+        let activeLayerIdx = 0;
+        function getActiveLayer() { return layers[activeLayerIdx]; }
+        function getStagingLayer() { return layers[1 - activeLayerIdx]; }
+        function getActiveVideo() { return getActiveLayer().video; }
+        function getActivePhoto() { return getActiveLayer().photo; }
+
         const poemEl = document.getElementById('poem-text');
         const authorEl = document.getElementById('author-text');
         const dateEl = document.getElementById('date-display');
@@ -278,7 +393,6 @@
         const HISTORY_LIMIT = 50;
 
         function showLoader(msg = "Loading...", force = false) {
-            // NEVER cover the screen if a memory is already displaying, unless forced by user action
             if (!force && currentMemory) return;
             loaderText.innerText = msg;
             loaderOverlay.classList.add('visible');
@@ -300,73 +414,159 @@
                 }
             }, 2000);
         });
-        // Initial state: hide cursor by default
         document.body.classList.add('hide-cursor');
 
-        // Video playback event listeners & completion handling
+        // Video playback event listeners & safety handling
+        let decodedFrameCheckDone = false;
+
+        function scheduleVideoTimer(vid) {
+            if (displayTimer) clearTimeout(displayTimer);
+            const dur = vid.duration;
+            const safeTimeoutMs = (dur && isFinite(dur) && dur > 0) ? Math.max((dur + 3) * 1000, 8000) : 45000;
+            displayTimer = setTimeout(() => {
+                console.log("Video dynamic safety timer reached, advancing...");
+                onVideoEnd();
+            }, safeTimeoutMs);
+        }
+
         function onVideoEnd() {
             if (!currentMemory || !currentMemory.isVideo || videoEndedTriggered) return;
             videoEndedTriggered = true;
             if (displayTimer) clearTimeout(displayTimer);
             console.log("🎬 Video finished playing, advancing to next memory.");
             // Brief 400ms hold on final frame for seamless transition
-            setTimeout(() => updateDisplay(false), 400);
+            setTimeout(() => updateDisplay(false, false), 400);
         }
 
-        videoEl.addEventListener('ended', onVideoEnd);
-
-        let decodedFrameCheckDone = false;
-        videoEl.addEventListener('playing', () => {
-            decodedFrameCheckDone = false;
-        });
-
-        videoEl.addEventListener('timeupdate', () => {
-            if (!currentMemory || !currentMemory.isVideo) return;
-            const cur = videoEl.currentTime;
-            const dur = videoEl.duration;
-            videoTimeText.innerText = `${formatTime(cur)} / ${formatTime(dur)}`;
-
-            // Black screen watchdog: if playback has progressed 1.5s but 0 frames were decoded,
-            // the video codec is unsupported by the browser decoder. Advance immediately.
-            if (!decodedFrameCheckDone && cur > 1.5) {
-                decodedFrameCheckDone = true;
-                if (typeof videoEl.webkitDecodedFrameCount === 'number' && videoEl.webkitDecodedFrameCount === 0) {
-                    console.warn("⚠️ Detected unsupported video codec (0 decoded visual frames). Skipping black video...");
-                    onVideoEnd();
-                    return;
-                }
-            }
-
-            // Near-end completion guard (catches codecs that stall or skip native 'ended')
-            if (dur > 0 && cur >= dur - 0.25) {
+        function attachVideoListeners(vid) {
+            vid.addEventListener('ended', () => {
+                if (vid !== getActiveVideo()) return;
                 onVideoEnd();
-            }
-        });
+            });
 
+            vid.addEventListener('playing', () => {
+                if (vid !== getActiveVideo()) return;
+                decodedFrameCheckDone = false;
+            });
 
-        videoEl.addEventListener('loadedmetadata', () => {
-            if (!currentMemory || !currentMemory.isVideo) return;
-            const dur = videoEl.duration;
-            videoTimeText.innerText = `0:00 / ${formatTime(dur)}`;
-            if (dur && isFinite(dur) && dur > 0) {
-                if (displayTimer) clearTimeout(displayTimer);
-                const safeTimeoutMs = Math.max((dur + 3) * 1000, 8000);
-                displayTimer = setTimeout(() => {
-                    console.log("Video dynamic safety timer reached, advancing...");
+            vid.addEventListener('timeupdate', () => {
+                if (!currentMemory || !currentMemory.isVideo) return;
+                if (vid !== getActiveVideo()) return;
+                const cur = vid.currentTime;
+                const dur = vid.duration;
+                videoTimeText.innerText = `${formatTime(cur)} / ${formatTime(dur)}`;
+
+                // Black screen watchdog: if playback has progressed 1.5s but 0 frames were decoded,
+                // the video codec is unsupported by the browser decoder. Advance immediately.
+                if (!decodedFrameCheckDone && cur > 1.5) {
+                    decodedFrameCheckDone = true;
+                    if (typeof vid.webkitDecodedFrameCount === 'number' && vid.webkitDecodedFrameCount === 0) {
+                        console.warn("⚠️ Detected unsupported video codec (0 decoded visual frames). Skipping black video...");
+                        onVideoEnd();
+                        return;
+                    }
+                }
+
+                // Near-end completion guard (catches codecs that stall or skip native 'ended')
+                if (dur > 0 && cur >= dur - 0.25) {
                     onVideoEnd();
-                }, safeTimeoutMs);
+                }
+            });
+
+            vid.addEventListener('loadedmetadata', () => {
+                if (!currentMemory || !currentMemory.isVideo) return;
+                if (vid !== getActiveVideo()) return;
+                const dur = vid.duration;
+                videoTimeText.innerText = `0:00 / ${formatTime(dur)}`;
+                if (dur && isFinite(dur) && dur > 0) {
+                    scheduleVideoTimer(vid);
+                }
+            });
+
+            vid.addEventListener('error', (e) => {
+                if (!currentMemory || !currentMemory.isVideo) return;
+                if (vid !== getActiveVideo()) return;
+                if (!vid.currentSrc && !vid.src) return;
+                console.warn("⚠️ Active video playback error, advancing to next memory:", e);
+                if (displayTimer) clearTimeout(displayTimer);
+                displayTimer = setTimeout(() => updateDisplay(false, false), 1500);
+            });
+        }
+
+        layers.forEach(l => attachVideoListeners(l.video));
+
+        async function prepareMemoryInLayer(targetLayer, memoryData) {
+            if (!memoryData) return null;
+
+            if (memoryData.isVideo) {
+                targetLayer.photo.style.display = 'none';
+                targetLayer.photo.src = '';
+
+                targetLayer.video.style.display = 'block';
+                targetLayer.video.muted = true;
+                targetLayer.video.preload = 'auto';
+                const videoSrc = memoryData.mediaUrl || `/api/media?path=${memoryData.imagePathEncoded}`;
+                targetLayer.video.src = videoSrc;
+                targetLayer.video.load();
+
+                // Wait until at least first frame is ready (readyState >= 2 = HAVE_CURRENT_DATA)
+                await new Promise((resolve) => {
+                    if (targetLayer.video.readyState >= 2) return resolve();
+                    let done = false;
+                    const onReady = () => {
+                        if (!done) { done = true; cleanup(); resolve(); }
+                    };
+                    const onError = () => {
+                        if (!done) { done = true; cleanup(); resolve(); }
+                    };
+                    const timer = setTimeout(() => {
+                        if (!done) { done = true; cleanup(); resolve(); }
+                    }, 45000); // 45s safety timeout for long transcodes
+
+                    const cleanup = () => {
+                        clearTimeout(timer);
+                        targetLayer.video.removeEventListener('canplay', onReady);
+                        targetLayer.video.removeEventListener('loadeddata', onReady);
+                        targetLayer.video.removeEventListener('error', onError);
+                    };
+
+                    targetLayer.video.addEventListener('canplay', onReady);
+                    targetLayer.video.addEventListener('loadeddata', onReady);
+                    targetLayer.video.addEventListener('error', onError);
+                });
+
+                return { ...memoryData, isVideo: true };
+            } else {
+                try { targetLayer.video.pause(); } catch(e) {}
+                targetLayer.video.removeAttribute('src');
+                targetLayer.video.load();
+                targetLayer.video.style.display = 'none';
+
+                targetLayer.photo.style.display = 'block';
+                const imgSrc = memoryData.mediaUrl || `/api/image?path=${memoryData.imagePathEncoded}`;
+                targetLayer.photo.src = imgSrc;
+
+                // Ensure image is fully loaded and decoded in GPU memory
+                try {
+                    if (targetLayer.photo.decode) {
+                        await targetLayer.photo.decode();
+                    } else {
+                        await new Promise((resolve) => {
+                            if (targetLayer.photo.complete) return resolve();
+                            targetLayer.photo.onload = () => resolve();
+                            targetLayer.photo.onerror = () => resolve();
+                            setTimeout(resolve, 20000);
+                        });
+                    }
+                } catch (e) {
+                    // Fallback gracefully
+                }
+
+                return { ...memoryData, isVideo: false };
             }
-        });
+        }
 
-        videoEl.addEventListener('error', (e) => {
-            if (!currentMemory || !currentMemory.isVideo) return;
-            if (!videoEl.currentSrc && !videoEl.src) return;
-            console.warn("⚠️ Video playback error, advancing to next memory:", e);
-            if (displayTimer) clearTimeout(displayTimer);
-            displayTimer = setTimeout(() => updateDisplay(false), 1500);
-        });
-
-        async function fetchNextMemory() {
+        async function fetchNextMemory(targetLayer) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 45000);
 
@@ -378,74 +578,38 @@
                 if (!response.ok) throw new Error(`Server Error: ${response.status}`);
                 const data = await response.json();
 
-                if (data.isVideo) {
-                    return new Promise((resolve) => {
-                        const vid = document.createElement('video');
-                        vid.preload = 'metadata';
-                        vid.muted = true;
-                        vid.src = data.mediaUrl || `/api/media?path=${data.imagePathEncoded}`;
-                        
-                        let resolved = false;
-                        const onLoaded = () => {
-                            if (!resolved) {
-                                resolved = true;
-                                cleanup();
-                                resolve({ ...data, mediaSrc: vid.src, isVideo: true });
-                            }
-                        };
-                        const onError = () => {
-                            if (!resolved) {
-                                resolved = true;
-                                cleanup();
-                                resolve({ ...data, mediaSrc: vid.src, isVideo: true });
-                            }
-                        };
-                        const timeout = setTimeout(() => {
-                            if (!resolved) {
-                                resolved = true;
-                                cleanup();
-                                resolve({ ...data, mediaSrc: vid.src, isVideo: true });
-                            }
-                        }, 10000);
-                        const cleanup = () => {
-                            clearTimeout(timeout);
-                            vid.removeEventListener('loadeddata', onLoaded);
-                            vid.removeEventListener('loadedmetadata', onLoaded);
-                            vid.removeEventListener('canplay', onLoaded);
-                            vid.removeEventListener('error', onError);
-                        };
-                        vid.addEventListener('loadeddata', onLoaded);
-                        vid.addEventListener('loadedmetadata', onLoaded);
-                        vid.addEventListener('canplay', onLoaded);
-                        vid.addEventListener('error', onError);
-                    });
-                } else {
-                    return new Promise((resolve, reject) => {
-                        const img = new Image();
-                        img.src = data.mediaUrl || `/api/image?path=${data.imagePathEncoded}`;
-                        img.onload = () => resolve({ ...data, imageSrc: img.src, isVideo: false });
-                        img.onerror = () => reject(new Error("Image load failed"));
-                        setTimeout(() => reject(new Error("Image load timed out")), 25000);
-                    });
-                }
+                return await prepareMemoryInLayer(targetLayer, data);
             } catch (error) {
                 console.warn("Background fetch failed:", error);
                 return null;
             }
         }
 
-        function renderMemory(memory) {
+        function waitForVideoPlayback(vid) {
+            return new Promise((resolve) => {
+                if (!vid.paused && vid.currentTime > 0) return resolve();
+                let done = false;
+                const onPlaying = () => {
+                    if (!done) { done = true; cleanup(); resolve(); }
+                };
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    vid.removeEventListener('playing', onPlaying);
+                    vid.removeEventListener('timeupdate', onPlaying);
+                };
+                const timer = setTimeout(() => {
+                    if (!done) { done = true; cleanup(); resolve(); }
+                }, 300);
+
+                vid.addEventListener('playing', onPlaying);
+                vid.addEventListener('timeupdate', onPlaying);
+            });
+        }
+
+        function renderOverlayText(memory) {
             if (!memory) return;
 
             if (memory.isVideo) {
-                videoEndedTriggered = false;
-                photoEl.style.display = 'none';
-                photoEl.src = '';
-                videoEl.style.display = 'block';
-                videoEl.src = memory.mediaSrc || `/api/media?path=${memory.imagePathEncoded}`;
-                videoEl.load();
-                videoEl.muted = true;
-
                 poemEl.innerText = "";
                 poemEl.style.display = 'none';
                 authorEl.style.display = 'none';
@@ -455,13 +619,6 @@
                 videoIndicatorEl.classList.add('visible');
             } else {
                 videoIndicatorEl.classList.remove('visible');
-                try { videoEl.pause(); } catch(e) {}
-                videoEl.removeAttribute('src');
-                videoEl.load();
-                videoEl.style.display = 'none';
-                photoEl.style.display = 'block';
-                photoEl.src = memory.imageSrc || `/api/image?path=${memory.imagePathEncoded}`;
-
                 poemEl.innerText = memory.text ? `"${memory.text}"` : "";
                 poemEl.style.display = memory.text ? 'block' : 'none';
                 
@@ -479,7 +636,7 @@
                     poemEl.style.color = '#f0f0f0';
                 }
             }
-            
+
             if (memory.isFavorite) quickFavBtn.classList.add('active');
             else quickFavBtn.classList.remove('active');
 
@@ -489,85 +646,118 @@
             } else {
                 dateEl.innerText = ""; 
             }
-
-            // Buffer successfully loaded memory
-            if (memory.imagePathEncoded && !memory.imagePathEncoded.includes('__error_placeholder__')) {
-                if (!memoryBuffer.some(m => m.imagePathEncoded === memory.imagePathEncoded)) {
-                    memoryBuffer.push(memory);
-                    if (memoryBuffer.length > BUFFER_CAP) memoryBuffer.shift();
-                }
-            }
         }
 
         async function updateDisplay(useHistory = false, isUserTap = false) {
             if (isProcessing) return;
+            isProcessing = true;
 
             try {
                 if (displayTimer) clearTimeout(displayTimer);
 
-                // Show loader ONLY on very initial boot if nothing is visible
+                // --- 1. INITIAL BOOTSTRAP ---
                 if (!currentMemory) {
-                    showLoader("Loading memories...");
-                }
-
-                let memory = null;
-                if (useHistory && historyStack.length > 0) {
-                    memory = historyStack.pop();
-                    nextMemoryPromise = null; 
-                } else {
-                    if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
-                    
-                    try {
-                        const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
-                        // On manual user tap, if we have other buffered memories, wait at most 1.5s for fresh fetch before showing a buffered memory
-                        if (isUserTap && candidates.length > 0) {
-                            memory = await Promise.race([
-                                nextMemoryPromise,
-                                new Promise(resolve => setTimeout(() => resolve(null), 1500))
-                            ]);
-                        } else {
-                            memory = await nextMemoryPromise;
-                        }
-                    } catch (e) {
-                        console.warn("Awaiting memory promise failed:", e);
-                        memory = null;
+                    showLoader("Loading memories...", true);
+                    const memory = await fetchNextMemory(getActiveLayer());
+                    if (!memory) {
+                        displayTimer = setTimeout(() => { isProcessing = false; updateDisplay(false, false); }, 3000);
+                        return;
                     }
-                    // ALWAYS reset nextMemoryPromise once awaited so subsequent cycles fetch fresh
-                    nextMemoryPromise = null;
-                }
-
-                // If fetch returned null (e.g. temporary network drop or user tap race timeout)
-                if (!memory && memoryBuffer.length > 0) {
-                    const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
-                    if (candidates.length > 0) {
-                        memory = candidates[Math.floor(Math.random() * candidates.length)];
-                        console.log("ℹ️ Seamless fallback to buffered memory:", memory.imagePathEncoded);
-                    }
-                }
-
-                // If user tapped Next and no memory was ready (e.g. initial boot before buffer fills), actively fetch
-                if (!memory && isUserTap) {
-                    showLoader("Loading next memory...");
-                    try {
-                        memory = await fetchNextMemory();
-                    } catch (e) {
-                        memory = null;
-                    }
+                    currentMemory = memory;
+                    renderOverlayText(memory);
                     hideLoader();
-                }
+                    getActiveLayer().container.classList.add('active');
 
-                // If still no memory, or if it resolves to the exact same memory currently displayed:
-                // Keep current memory peacefully on screen and retry in 2 seconds. NEVER flash the screen!
-                if (!memory || (currentMemory && memory.imagePathEncoded === currentMemory.imagePathEncoded)) {
-                    if (!currentMemory) showLoader("Waiting for memories...");
-                    if (!nextMemoryPromise) nextMemoryPromise = fetchNextMemory();
-                    if (displayTimer) clearTimeout(displayTimer);
-                    displayTimer = setTimeout(() => updateDisplay(false), 2000);
+                    if (memory.isVideo) {
+                        videoEndedTriggered = false;
+                        getActiveVideo().play().catch(e => {});
+                        scheduleVideoTimer(getActiveVideo());
+                    } else {
+                        poemEl.style.opacity = 1;
+                        if (memory.type === 'quote') authorEl.style.opacity = 1;
+                        dateEl.style.opacity = 1;
+                        displayTimer = setTimeout(() => updateDisplay(false, false), currentInterval);
+                    }
+
+                    // Kick off prefetching next memory into staging layer
+                    nextMemoryPromise = fetchNextMemory(getStagingLayer());
                     return;
                 }
 
-                // Lock ONLY during the actual visual fade and switch
-                isProcessing = true;
+                // --- 2. RETRIEVE NEXT MEMORY ---
+                let memory = null;
+                const staging = getStagingLayer();
+
+                if (useHistory && historyStack.length > 0) {
+                    // History back: user explicitly requested
+                    showLoader("Loading previous memory...", true);
+                    getActiveLayer().container.classList.remove('active');
+                    const histData = historyStack.pop();
+                    memory = await prepareMemoryInLayer(staging, histData);
+                    hideLoader();
+                    nextMemoryPromise = null;
+                } else {
+                    if (!nextMemoryPromise) {
+                        nextMemoryPromise = fetchNextMemory(staging);
+                    }
+
+                    if (isUserTap) {
+                        // User forced next!
+                        // Check if already ready or resolves quickly (within 200ms)
+                        let wasReady = false;
+                        try {
+                            memory = await Promise.race([
+                                nextMemoryPromise,
+                                new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 200))
+                            ]);
+                            wasReady = true;
+                        } catch (e) {
+                            wasReady = false;
+                        }
+
+                        if (!wasReady) {
+                            // User forced next and it's not ready yet: move away from current item into loading screen
+                            getActiveLayer().container.classList.remove('active');
+                            showLoader("Loading next memory...", true);
+                            try {
+                                memory = await nextMemoryPromise;
+                            } catch (e) {
+                                memory = null;
+                            }
+                            hideLoader();
+                        }
+                    } else {
+                        // Automatic progression:
+                        // Current memory stays on screen peacefully until next is 100% ready!
+                        try {
+                            memory = await nextMemoryPromise;
+                        } catch (e) {
+                            memory = null;
+                        }
+                    }
+
+                    nextMemoryPromise = null;
+                }
+
+                // Fallback to buffered memory if network drop
+                if (!memory && memoryBuffer.length > 0) {
+                    const candidates = memoryBuffer.filter(m => !currentMemory || m.imagePathEncoded !== currentMemory.imagePathEncoded);
+                    if (candidates.length > 0) {
+                        const fallbackData = candidates[Math.floor(Math.random() * candidates.length)];
+                        memory = await prepareMemoryInLayer(staging, fallbackData);
+                    }
+                }
+
+                // If still no memory, keep current peaceful and retry in 3 seconds
+                if (!memory) {
+                    if (displayTimer) clearTimeout(displayTimer);
+                    displayTimer = setTimeout(() => updateDisplay(false, false), 3000);
+                    return;
+                }
+
+                // --- 3. SEAMLESS CROSSFADE TRANSITION ---
+                const incomingLayer = staging;
+                const outgoingLayer = getActiveLayer();
 
                 if (currentMemory && memory.imagePathEncoded !== currentMemory.imagePathEncoded) {
                     historyStack.push(currentMemory);
@@ -575,58 +765,66 @@
                 }
 
                 currentMemory = memory;
+                videoEndedTriggered = false;
 
-                photoEl.style.opacity = 0;
-                videoEl.style.opacity = 0;
+                // If incoming is video, start playing before crossfade so first frame is active
+                if (memory.isVideo) {
+                    try {
+                        await incomingLayer.video.play();
+                    } catch (playErr) {
+                        console.warn("Video play error:", playErr);
+                    }
+                    await waitForVideoPlayback(incomingLayer.video);
+                    scheduleVideoTimer(incomingLayer.video);
+                } else {
+                    displayTimer = setTimeout(() => updateDisplay(false, false), currentInterval);
+                }
+
+                // Smoothly fade text
                 poemEl.style.opacity = 0;
                 authorEl.style.opacity = 0;
                 dateEl.style.opacity = 0;
-                videoIndicatorEl.classList.remove('visible');
-                
-                await new Promise(r => setTimeout(r, 800)); 
 
-                renderMemory(memory);
-                hideLoader();
-
-                if (memory.isVideo) {
-                    videoEl.style.opacity = 1;
+                setTimeout(() => {
+                    renderOverlayText(memory);
+                    if (!memory.isVideo) {
+                        poemEl.style.opacity = 1;
+                        if (memory.type === 'quote') authorEl.style.opacity = 1;
+                    }
                     dateEl.style.opacity = 1;
-                    videoIndicatorEl.classList.add('visible');
+                }, 400);
 
-                    videoEl.play().catch(err => {
-                        console.warn("Video play error:", err);
-                        displayTimer = setTimeout(() => updateDisplay(false), 2000);
-                    });
+                // CROSSFADE: incoming fades in over outgoing
+                incomingLayer.container.classList.add('active');
+                outgoingLayer.container.classList.remove('active');
 
-                    // Dynamic safety cap: duration + 3s if duration is already known, otherwise default 45s
-                    if (displayTimer) clearTimeout(displayTimer);
-                    const dur = videoEl.duration;
-                    const safeTimeoutMs = (dur && isFinite(dur) && dur > 0) ? Math.max((dur + 3) * 1000, 8000) : 45000;
-                    displayTimer = setTimeout(() => {
-                        console.log("Video safety cap reached, advancing...");
-                        onVideoEnd();
-                    }, safeTimeoutMs);
-                } else {
-                    photoEl.style.opacity = 1;
-                    poemEl.style.opacity = 1;
-                    if (memory.type === 'quote') authorEl.style.opacity = 1;
-                    dateEl.style.opacity = 1;
+                // Switch active layer index
+                activeLayerIdx = 1 - activeLayerIdx;
 
-                    if (displayTimer) clearTimeout(displayTimer);
-                    displayTimer = setTimeout(() => updateDisplay(false), currentInterval);
-                }
+                // After crossfade finishes (1200ms), unload outgoing video to free memory
+                setTimeout(() => {
+                    try { outgoingLayer.video.pause(); } catch(e) {}
+                    outgoingLayer.video.removeAttribute('src');
+                    outgoingLayer.video.load();
 
-                // Start preloading the next memory quietly in the background
-                if (!nextMemoryPromise) {
-                    nextMemoryPromise = fetchNextMemory();
-                }
+                    // Buffer memory
+                    if (memory.imagePathEncoded && !memory.imagePathEncoded.includes('__error_placeholder__')) {
+                        if (!memoryBuffer.some(m => m.imagePathEncoded === memory.imagePathEncoded)) {
+                            memoryBuffer.push(memory);
+                            if (memoryBuffer.length > BUFFER_CAP) memoryBuffer.shift();
+                        }
+                    }
 
-            } catch (error) {
-                console.error("Display update unexpected error:", error);
-                nextMemoryPromise = null;
-                if (!currentMemory) showLoader("Retrying Connection...");
+                    // Start prefetching the NEXT memory into the new staging layer!
+                    if (!nextMemoryPromise) {
+                        nextMemoryPromise = fetchNextMemory(getStagingLayer());
+                    }
+                }, 1200);
+
+            } catch (err) {
+                console.error("updateDisplay unexpected error:", err);
                 if (displayTimer) clearTimeout(displayTimer);
-                displayTimer = setTimeout(() => updateDisplay(false), 4000); 
+                displayTimer = setTimeout(() => updateDisplay(false, false), 4000);
             } finally {
                 isProcessing = false;
             }
@@ -641,7 +839,7 @@
         document.getElementById('zone-center').addEventListener('click', () => {
             if (displayTimer) clearTimeout(displayTimer); 
             if (currentMemory && currentMemory.isVideo) {
-                try { videoEl.pause(); } catch(e) {}
+                try { getActiveVideo().pause(); } catch(e) {}
                 videoStatusIcon.innerText = "⏸";
             }
             menuOverlay.classList.add('overlay-visible');
@@ -674,15 +872,15 @@
                 if (displayTimer) clearTimeout(displayTimer);
                 if (currentMemory && currentMemory.isVideo) {
                     videoStatusIcon.innerText = "▶";
-                    videoEl.play().catch(e => {});
-                    const dur = videoEl.duration;
-                    const cur = videoEl.currentTime;
+                    getActiveVideo().play().catch(e => {});
+                    const dur = getActiveVideo().duration;
+                    const cur = getActiveVideo().currentTime;
                     const safeRemainingMs = (dur && isFinite(dur) && dur > 0) ? Math.max((dur - cur + 3) * 1000, 3000) : 45000;
                     displayTimer = setTimeout(() => {
                         onVideoEnd();
                     }, safeRemainingMs);
                 } else {
-                    displayTimer = setTimeout(updateDisplay, currentInterval);
+                    displayTimer = setTimeout(() => updateDisplay(false, false), currentInterval);
                 }
             },
             
@@ -736,7 +934,7 @@
                         menuActions.close();
                         nextMemoryPromise = null;
                         isProcessing = false;
-                        updateDisplay(false);
+                        updateDisplay(false, true);
                     } else {
                         const err = await res.json();
                         hideLoader();
@@ -773,9 +971,9 @@
                 deletePreviewVideo.removeAttribute('src');
                 deletePreviewVideo.load();
                 if (currentMemory && currentMemory.isVideo) {
-                    videoEl.play().catch(e => {});
+                    getActiveVideo().play().catch(e => {});
                 }
-                displayTimer = setTimeout(updateDisplay, currentInterval);
+                displayTimer = setTimeout(() => updateDisplay(false, false), currentInterval);
             },
 
             doDelete: async () => {
@@ -794,7 +992,7 @@
                         deleteOverlay.classList.remove('overlay-visible');
                         nextMemoryPromise = null; 
                         isProcessing = false; 
-                        updateDisplay(false); 
+                        updateDisplay(false, true); 
                     } else {
                         const err = await res.json();
                         hideLoader();
@@ -816,6 +1014,90 @@
                 }
             }
         };
+
+        // --- WEATHER WIDGET ---
+        const weatherWidget = document.getElementById('weather-widget');
+        const weatherTimeA = document.getElementById('weather-time-a');
+        const weatherDayA = document.getElementById('weather-day-a');
+        const weatherIconA = document.getElementById('weather-icon-a');
+        const weatherTempA = document.getElementById('weather-temp-a');
+        const weatherTimeB = document.getElementById('weather-time-b');
+        const weatherDayB = document.getElementById('weather-day-b');
+        const weatherIconB = document.getElementById('weather-icon-b');
+        const weatherTempB = document.getElementById('weather-temp-b');
+
+        const WEATHER_ICONS = {
+            'sunny': `<svg viewBox="0 0 24 24" fill="none" stroke="#f5af19" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="5" fill="#f5af19" fill-opacity="0.3"/>
+                <line x1="12" y1="1" x2="12" y2="3"/>
+                <line x1="12" y1="21" x2="12" y2="23"/>
+                <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
+                <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+                <line x1="1" y1="12" x2="3" y2="12"/>
+                <line x1="21" y1="12" x2="23" y2="12"/>
+                <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
+                <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+            </svg>`,
+            'partly-cloudy': `<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2v2" stroke="#f5af19"/>
+                <path d="M4.93 4.93l1.41 1.41" stroke="#f5af19"/>
+                <path d="M20 12h2" stroke="#f5af19"/>
+                <path d="M19.07 4.93l-1.41 1.41" stroke="#f5af19"/>
+                <path d="M15.5 8.5A4.5 4.5 0 0 0 8 11a4 4 0 0 0 .5 8h9a3.5 3.5 0 0 0 0-7c-.3 0-.6.04-.88.11" fill="#fff" fill-opacity="0.2" stroke="#fff"/>
+            </svg>`,
+            'cloudy': `<svg viewBox="0 0 24 24" fill="none" stroke="#ccc" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" fill="#fff" fill-opacity="0.2"/>
+            </svg>`,
+            'rainy': `<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25" stroke="#ccc" fill="#fff" fill-opacity="0.1"/>
+                <line x1="8" y1="19" x2="8" y2="21" stroke="#4fc3f7"/>
+                <line x1="12" y1="17" x2="12" y2="21" stroke="#4fc3f7"/>
+                <line x1="16" y1="19" x2="16" y2="21" stroke="#4fc3f7"/>
+            </svg>`,
+            'snowy': `<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 17.58A5 5 0 0 0 18 8h-1.26A8 8 0 1 0 4 16.25" stroke="#ccc" fill="#fff" fill-opacity="0.1"/>
+                <circle cx="8" cy="20" r="1" fill="#fff"/>
+                <circle cx="12" cy="19" r="1" fill="#fff"/>
+                <circle cx="16" cy="20" r="1" fill="#fff"/>
+            </svg>`,
+            'thunderstorm': `<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M19 16.9A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25" stroke="#ccc" fill="#fff" fill-opacity="0.1"/>
+                <polygon points="13 11 9 17 14 17 11 23 18 15 13 15 15 11" fill="#ffd166" stroke="#ffd166"/>
+            </svg>`,
+            'foggy': `<svg viewBox="0 0 24 24" fill="none" stroke="#bbb" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="4" y1="7" x2="20" y2="7"/>
+                <line x1="6" y1="11" x2="18" y2="11"/>
+                <line x1="3" y1="15" x2="21" y2="15"/>
+                <line x1="7" y1="19" x2="17" y2="19"/>
+            </svg>`
+        };
+
+        async function updateWeather() {
+            try {
+                const res = await fetch('/api/weather');
+                if (!res.ok) return;
+                const data = await res.json();
+                if (!data || !data.slotA || !data.slotB) return;
+
+                if (data.slotA.timeLabel && weatherTimeA) weatherTimeA.innerText = data.slotA.timeLabel;
+                weatherDayA.innerText = data.slotA.dayLabel;
+                weatherIconA.innerHTML = WEATHER_ICONS[data.slotA.symbol] || WEATHER_ICONS['partly-cloudy'];
+                weatherTempA.innerText = `${data.slotA.temp}`;
+
+                if (data.slotB.timeLabel && weatherTimeB) weatherTimeB.innerText = data.slotB.timeLabel;
+                weatherDayB.innerText = data.slotB.dayLabel;
+                weatherIconB.innerHTML = WEATHER_ICONS[data.slotB.symbol] || WEATHER_ICONS['partly-cloudy'];
+                weatherTempB.innerText = `${data.slotB.temp}`;
+
+                weatherWidget.classList.add('visible');
+            } catch (e) {
+                // Keep existing display if momentary network glitch
+            }
+        }
+
+        // Initialize weather and update periodically every 10 minutes
+        updateWeather();
+        setInterval(updateWeather, 10 * 60 * 1000);
 
         // Start App
         updateDisplay();

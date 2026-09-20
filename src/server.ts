@@ -61,6 +61,7 @@ import {
     Photo,
     QuoteEntry
 } from './db';
+import { weatherService } from './weather';
 
 
 const VIDEO_EXTENSIONS = new Set(['.mp4', '.mov', '.m4v', '.webm']);
@@ -960,10 +961,23 @@ app.post('/api/reindex', (req, res) => {
     performIndexing(false);
 });
 
+app.get('/api/weather', async (req, res) => {
+    try {
+        const weather = await weatherService.getWeather();
+        if (!weather) {
+            return res.status(503).json({ error: 'Weather data temporarily unavailable' });
+        }
+        res.json(weather);
+    } catch (err: any) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
     initDatabase();
     const stats = getDbStats();
     console.log(`📚 Database ready: ${stats.totalPhotos} photos (${stats.indexedHashes} hashed, ${stats.favoritesCount} favorites) | 📜 ${stats.totalQuotes} quotes`);
     if (stats.totalPhotos === 0) performIndexing(false);
+    weatherService.fetchForecast().catch(err => console.warn(`[WeatherService] Initial fetch failed: ${err.message}`));
 });
