@@ -1,8 +1,7 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import { config } from './config';
 
 export interface WeatherSlot {
-    timeLabel: string; // '9am' or '4pm'
+    timeLabel: string;
     dayLabel: 'today' | 'tmrw';
     targetIso: string;
     symbol: 'sunny' | 'partly-cloudy' | 'cloudy' | 'rainy' | 'snowy' | 'thunderstorm' | 'foggy';
@@ -36,15 +35,21 @@ export class WeatherService {
     private cacheTtlMs: number;
 
     private cachedRawData: any = null;
-    private lastFetchTime: number = 0;
-    private isFetching: boolean = false;
+    private lastFetchTime = 0;
+    private inFlightFetch: Promise<any> | null = null;
 
-    constructor() {
-        this.locationName = process.env.WEATHER_LOCATION || 'Santarem, Portugal';
-        this.latitude = parseFloat(process.env.WEATHER_LATITUDE || '39.2338');
-        this.longitude = parseFloat(process.env.WEATHER_LONGITUDE || '-8.6862');
-        this.timezone = process.env.WEATHER_TIMEZONE || 'Europe/Lisbon';
-        this.cacheTtlMs = parseInt(process.env.WEATHER_CACHE_TTL_MS || `${30 * 60 * 1000}`, 10);
+    constructor(opts?: {
+        locationName?: string;
+        latitude?: number;
+        longitude?: number;
+        timezone?: string;
+        cacheTtlMs?: number;
+    }) {
+        this.locationName = opts?.locationName || config.weatherLocation;
+        this.latitude = opts?.latitude ?? config.weatherLatitude;
+        this.longitude = opts?.longitude ?? config.weatherLongitude;
+        this.timezone = opts?.timezone || config.weatherTimezone;
+        this.cacheTtlMs = opts?.cacheTtlMs ?? config.weatherCacheTtlMs;
     }
 
     private getZonedParts(date: Date): { year: number; month: number; day: number; dateStr: string; hour: number } {
@@ -55,18 +60,18 @@ export class WeatherService {
             day: '2-digit',
             hour: 'numeric',
             hourCycle: 'h23'
-        }).formatToParts(date).reduce<Record<string, string>>((acc, p) => {
-            acc[p.type] = p.value;
-            return acc;
-        }, {});
+        })
+            .formatToParts(date)
+            .reduce<Record<string, string>>((acc, p) => {
+                acc[p.type] = p.value;
+                return acc;
+            }, {});
 
         const year = parseInt(parts.year, 10);
         const month = parseInt(parts.month, 10);
         const day = parseInt(parts.day, 10);
         const hour = parseInt(parts.hour, 10);
-        const dateStr = `${parts.year}-${parts.month}-${parts.day}`;
-
-        return { year, month, day, dateStr, hour };
+        return { year, month, day, dateStr: `${parts.year}-${parts.month}-${parts.day}`, hour };
     }
 
     private getNextDayStr(year: number, month: number, day: number): string {
@@ -77,31 +82,46 @@ export class WeatherService {
         return `${y}-${m}-${d}`;
     }
 
+    /**
+     * Single-flight fetch coalescing: concurrent callers await the same in-flight promise.
+     */
     public async fetchForecast(): Promise<any> {
-        if (this.isFetching) return this.cachedRawData;
-        this.isFetching = true;
+        if (this.inFlightFetch) {
+            return this.inFlightFetch;
+        }
 
         const url = `https://api.open-meteo.com/v1/forecast?latitude=${this.latitude}&longitude=${this.longitude}&hourly=temperature_2m,weather_code&daily=temperature_2m_max&timezone=${encodeURIComponent(this.timezone)}&forecast_days=3`;
 
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-        try {
-            const response = await fetch(url, { signal: controller.signal });
-            if (!response.ok) {
-                throw new Error(`Open-Meteo returned HTTP ${response.status}`);
+        this.inFlightFetch = (async () => {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
+            try {
+                const response = await fetch(url, { signal: controller.signal });
+                if (!response.ok) {
+                    throw new Error(`Open-Meteo returned HTTP ${response.status}`);
+                }
+                const data = await response.json();
+                this.cachedRawData = data;
+                this.lastFetchTime = Date.now();
+                return data;
+            } finally {
+                clearTimeout(timeoutId);
+                this.inFlightFetch = null;
             }
-            const data = await response.json();
-            this.cachedRawData = data;
-            this.lastFetchTime = Date.now();
-            return data;
-        } finally {
-            clearTimeout(timeoutId);
-            this.isFetching = false;
-        }
+        })();
+
+        return this.inFlightFetch;
     }
 
-    public computeSlots(now: Date, rawData: any): WeatherResponse {
+    /**
+     * Computes 8am and 4pm slots. Returns null if required forecast data is missing
+     * (e.g. stale multi-day outage cache) instead of fabricating "0° Sunny".
+     */
+    public computeSlots(now: Date, rawData: any): WeatherResponse | null {
+        if (!rawData?.hourly?.time || !rawData?.hourly?.temperature_2m || !rawData?.hourly?.weather_code || !rawData?.daily?.time || !rawData?.daily?.temperature_2m_max) {
+            return null;
+        }
+
         const { dateStr: todayStr, year, month, day, hour: currentHour } = this.getZonedParts(now);
         const tomorrowStr = this.getNextDayStr(year, month, day);
 
@@ -111,9 +131,12 @@ export class WeatherService {
         const slotADayLabel: 'today' | 'tmrw' = slotAIsTomorrow ? 'tmrw' : 'today';
         const slotATargetIso = `${slotADate}T08:00`;
 
-        const idxA = rawData.hourly?.time?.indexOf(slotATargetIso) ?? -1;
-        const tempA = idxA !== -1 ? Math.round(rawData.hourly.temperature_2m[idxA]) : 0;
-        const weatherCodeA = idxA !== -1 ? rawData.hourly.weather_code[idxA] : 0;
+        const idxA = rawData.hourly.time.indexOf(slotATargetIso);
+        if (idxA === -1) return null;
+
+        const rawTempA = rawData.hourly.temperature_2m[idxA];
+        const rawCodeA = rawData.hourly.weather_code[idxA];
+        if (typeof rawTempA !== 'number' || typeof rawCodeA !== 'number') return null;
 
         // Slot B (4pm): Today if hour < 19, Tomorrow if hour >= 19
         const slotBIsTomorrow = currentHour >= 19;
@@ -121,12 +144,13 @@ export class WeatherService {
         const slotBDayLabel: 'today' | 'tmrw' = slotBIsTomorrow ? 'tmrw' : 'today';
         const slotBTargetIso = `${slotBDate}T16:00`;
 
-        const idxB = rawData.hourly?.time?.indexOf(slotBTargetIso) ?? -1;
-        const weatherCodeB = idxB !== -1 ? rawData.hourly.weather_code[idxB] : 0;
+        const idxB = rawData.hourly.time.indexOf(slotBTargetIso);
+        const dailyIdxB = rawData.daily.time.indexOf(slotBDate);
+        if (idxB === -1 || dailyIdxB === -1) return null;
 
-        // User preference: Slot B temperature uses daily max for the target day
-        const dailyIdxB = rawData.daily?.time?.indexOf(slotBDate) ?? -1;
-        const tempB = dailyIdxB !== -1 ? Math.round(rawData.daily.temperature_2m_max[dailyIdxB]) : 0;
+        const rawCodeB = rawData.hourly.weather_code[idxB];
+        const rawTempB = rawData.daily.temperature_2m_max[dailyIdxB];
+        if (typeof rawTempB !== 'number' || typeof rawCodeB !== 'number') return null;
 
         return {
             location: this.locationName,
@@ -135,35 +159,32 @@ export class WeatherService {
                 timeLabel: '8am',
                 dayLabel: slotADayLabel,
                 targetIso: slotATargetIso,
-                symbol: weatherCodeToSymbol(weatherCodeA),
-                temp: tempA,
-                weatherCode: weatherCodeA
+                symbol: weatherCodeToSymbol(rawCodeA),
+                temp: Math.round(rawTempA),
+                weatherCode: rawCodeA
             },
             slotB: {
                 timeLabel: '4pm',
                 dayLabel: slotBDayLabel,
                 targetIso: slotBTargetIso,
-                symbol: weatherCodeToSymbol(weatherCodeB),
-                temp: tempB,
-                weatherCode: weatherCodeB
+                symbol: weatherCodeToSymbol(rawCodeB),
+                temp: Math.round(rawTempB),
+                weatherCode: rawCodeB
             }
         };
     }
 
     public async getWeather(): Promise<WeatherResponse | null> {
         const now = Date.now();
-        if (!this.cachedRawData || (now - this.lastFetchTime > this.cacheTtlMs)) {
+        if (!this.cachedRawData || now - this.lastFetchTime > this.cacheTtlMs) {
             try {
                 await this.fetchForecast();
             } catch (err: any) {
-                console.warn(`[WeatherService] Forecast fetch failed: ${err.message}. Using cache if available.`);
+                console.warn(`[WeatherService] Forecast fetch failed: ${err?.message || err}. Using cache if available.`);
             }
         }
 
-        if (!this.cachedRawData || !this.cachedRawData.hourly || !this.cachedRawData.daily) {
-            return null;
-        }
-
+        if (!this.cachedRawData) return null;
         return this.computeSlots(new Date(), this.cachedRawData);
     }
 }

@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node dist/server.js",
     "dev": "ts-node src/server.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "npm run build && node --test tests/*.test.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.19.0",
