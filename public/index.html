@@ -311,6 +311,7 @@
                 <div style="height: 1px; background: #333; margin: 5px 0;"></div>
 
                 <button class="btn btn-reload" onclick="menuActions.reload()"><span>↻</span> Reload App</button>
+                <button class="btn btn-reload" onclick="menuActions.reboot()"><span>🔄</span> Restart Device</button>
                 <button class="btn btn-danger" onclick="menuActions.exit()"><span>⏻</span> Exit App</button>
                 <button class="btn btn-close" onclick="menuActions.close()">Close</button>
             </div>
@@ -339,6 +340,7 @@
         let currentMemory = null; 
         let historyStack = []; 
         let isProcessing = false;
+        let lastMemoryChangeTimestamp = Date.now();
 
         const layers = [
             {
@@ -352,6 +354,20 @@
                 video: document.querySelector('#layer-1 .layer-video')
             }
         ];
+        layers.forEach((layer, idx) => {
+            layer.photo.addEventListener('error', () => {
+                console.warn(`Layer ${idx} photo error event fired.`);
+                // If active layer broke, force advancement to next valid memory
+                if (idx === activeLayerIdx && currentMemory) {
+                    if (displayTimer) clearTimeout(displayTimer);
+                    displayTimer = setTimeout(() => {
+                        isProcessing = false;
+                        updateDisplay(false, false);
+                    }, 500);
+                }
+            });
+        });
+
         let activeLayerIdx = 0;
         function getActiveLayer() { return layers[activeLayerIdx]; }
         function getStagingLayer() { return layers[1 - activeLayerIdx]; }
@@ -392,14 +408,31 @@
         const BUFFER_CAP = 30;
         const HISTORY_LIMIT = 50;
 
+        let loaderTimeout = null;
         function showLoader(msg = "Loading...", force = false) {
             if (!force && currentMemory) return;
+            if (loaderTimeout) clearTimeout(loaderTimeout);
             loaderText.innerText = msg;
             loaderOverlay.classList.add('visible');
+            // Safety auto-dismiss: guarantees UI is never stuck behind an overlay
+            loaderTimeout = setTimeout(hideLoader, 12000);
         }
 
         function hideLoader() {
+            if (loaderTimeout) {
+                clearTimeout(loaderTimeout);
+                loaderTimeout = null;
+            }
             loaderOverlay.classList.remove('visible');
+        }
+
+        function purgeMediaFromBuffers(targetPath) {
+            historyStack = historyStack.filter(m => decodeURIComponent(m.imagePathEncoded) !== targetPath);
+            for (let i = memoryBuffer.length - 1; i >= 0; i--) {
+                if (decodeURIComponent(memoryBuffer[i].imagePathEncoded) === targetPath) {
+                    memoryBuffer.splice(i, 1);
+                }
+            }
         }
 
         let mouseTimer = null;
@@ -421,6 +454,11 @@
 
         function scheduleVideoTimer(vid) {
             if (displayTimer) clearTimeout(displayTimer);
+            if (currentMemory && currentMemory.isLivePhoto) {
+                // Live photo (<5s) stays on screen for the full photo slideshow duration
+                displayTimer = setTimeout(() => updateDisplay(false, false), currentInterval);
+                return;
+            }
             const dur = vid.duration;
             const safeTimeoutMs = (dur && isFinite(dur) && dur > 0) ? Math.max((dur + 3) * 1000, 8000) : 45000;
             displayTimer = setTimeout(() => {
@@ -431,16 +469,24 @@
 
         function onVideoEnd() {
             if (!currentMemory || !currentMemory.isVideo || videoEndedTriggered) return;
+            if (currentMemory.isLivePhoto) {
+                // Live photo holds its frame and lets the photo displayTimer advance
+                return;
+            }
             videoEndedTriggered = true;
             if (displayTimer) clearTimeout(displayTimer);
             console.log("🎬 Video finished playing, advancing to next memory.");
             // Brief 400ms hold on final frame for seamless transition
-            setTimeout(() => updateDisplay(false, false), 400);
+            displayTimer = setTimeout(() => updateDisplay(false, false), 400);
         }
 
         function attachVideoListeners(vid) {
             vid.addEventListener('ended', () => {
                 if (vid !== getActiveVideo()) return;
+                if (currentMemory && currentMemory.isLivePhoto) {
+                    try { vid.pause(); } catch(e) {}
+                    return;
+                }
                 onVideoEnd();
             });
 
@@ -454,7 +500,9 @@
                 if (vid !== getActiveVideo()) return;
                 const cur = vid.currentTime;
                 const dur = vid.duration;
-                videoTimeText.innerText = `${formatTime(cur)} / ${formatTime(dur)}`;
+                if (!currentMemory.isLivePhoto) {
+                    videoTimeText.innerText = `${formatTime(cur)} / ${formatTime(dur)}`;
+                }
 
                 // Black screen watchdog: if playback has progressed 1.5s but 0 frames were decoded,
                 // the video codec is unsupported by the browser decoder. Advance immediately.
@@ -469,7 +517,11 @@
 
                 // Near-end completion guard (catches codecs that stall or skip native 'ended')
                 if (dur > 0 && cur >= dur - 0.25) {
-                    onVideoEnd();
+                    if (currentMemory.isLivePhoto) {
+                        try { vid.pause(); } catch(e) {}
+                    } else {
+                        onVideoEnd();
+                    }
                 }
             });
 
@@ -477,10 +529,13 @@
                 if (!currentMemory || !currentMemory.isVideo) return;
                 if (vid !== getActiveVideo()) return;
                 const dur = vid.duration;
-                videoTimeText.innerText = `0:00 / ${formatTime(dur)}`;
-                if (dur && isFinite(dur) && dur > 0) {
-                    scheduleVideoTimer(vid);
+                if (dur && isFinite(dur) && dur > 0 && dur < 5.0) {
+                    currentMemory.isLivePhoto = true;
+                    videoIndicatorEl.classList.remove('visible');
+                } else {
+                    videoTimeText.innerText = `0:00 / ${formatTime(dur)}`;
                 }
+                scheduleVideoTimer(vid);
             });
 
             vid.addEventListener('error', (e) => {
@@ -535,33 +590,79 @@
                     targetLayer.video.addEventListener('error', onError);
                 });
 
-                return { ...memoryData, isVideo: true };
+                const dur = targetLayer.video.duration;
+                const isLivePhoto = (dur && isFinite(dur) && dur > 0 && dur < 5.0);
+                return { ...memoryData, isVideo: true, isLivePhoto: !!isLivePhoto };
             } else {
                 try { targetLayer.video.pause(); } catch(e) {}
                 targetLayer.video.removeAttribute('src');
                 targetLayer.video.load();
                 targetLayer.video.style.display = 'none';
 
-                targetLayer.photo.style.display = 'block';
                 const imgSrc = memoryData.mediaUrl || `/api/image?path=${memoryData.imagePathEncoded}`;
-                targetLayer.photo.src = imgSrc;
 
-                // Ensure image is fully loaded and decoded in GPU memory
+                let loadSuccess = false;
                 try {
+                    await new Promise((resolve, reject) => {
+                        let settled = false;
+                        const onDone = () => {
+                            if (settled) return;
+                            settled = true;
+                            cleanup();
+                            if (targetLayer.photo.naturalWidth > 0) {
+                                resolve(true);
+                            } else {
+                                reject(new Error("Image naturalWidth is 0"));
+                            }
+                        };
+                        const onErr = () => {
+                            if (settled) return;
+                            settled = true;
+                            cleanup();
+                            reject(new Error("Image failed to load"));
+                        };
+                        const timer = setTimeout(() => {
+                            if (settled) return;
+                            settled = true;
+                            cleanup();
+                            reject(new Error("Image load timeout"));
+                        }, 15000);
+
+                        const cleanup = () => {
+                            clearTimeout(timer);
+                            targetLayer.photo.removeEventListener('load', onDone);
+                            targetLayer.photo.removeEventListener('error', onErr);
+                        };
+
+                        targetLayer.photo.addEventListener('load', onDone);
+                        targetLayer.photo.addEventListener('error', onErr);
+
+                        targetLayer.photo.src = imgSrc;
+                        if (targetLayer.photo.complete && targetLayer.photo.naturalWidth > 0) {
+                            onDone();
+                        }
+                    });
+
+                    // Ensure decoded in GPU memory before displaying
                     if (targetLayer.photo.decode) {
-                        await targetLayer.photo.decode();
-                    } else {
-                        await new Promise((resolve) => {
-                            if (targetLayer.photo.complete) return resolve();
-                            targetLayer.photo.onload = () => resolve();
-                            targetLayer.photo.onerror = () => resolve();
-                            setTimeout(resolve, 20000);
-                        });
+                        await Promise.race([
+                            targetLayer.photo.decode(),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error("Decode timeout")), 5000))
+                        ]);
                     }
+                    loadSuccess = true;
                 } catch (e) {
-                    // Fallback gracefully
+                    console.warn("Image load/decode failure:", memoryData.imagePathEncoded, e.message);
+                    loadSuccess = false;
                 }
 
+                if (!loadSuccess || !targetLayer.photo.naturalWidth) {
+                    targetLayer.photo.src = '';
+                    targetLayer.photo.style.display = 'none';
+                    return null;
+                }
+
+                targetLayer.photo.style.display = 'block';
                 return { ...memoryData, isVideo: false };
             }
         }
@@ -578,7 +679,16 @@
                 if (!response.ok) throw new Error(`Server Error: ${response.status}`);
                 const data = await response.json();
 
-                return await prepareMemoryInLayer(targetLayer, data);
+                const prepared = await prepareMemoryInLayer(targetLayer, data);
+                if (prepared) {
+                    if (!memoryBuffer.some(m => m.imagePathEncoded === prepared.imagePathEncoded)) {
+                        memoryBuffer.push(prepared);
+                        if (memoryBuffer.length > BUFFER_CAP) memoryBuffer.shift();
+                    }
+                    return prepared;
+                }
+                console.warn("⚠️ Memory preparation failed. Discarding invalid memory.");
+                return null;
             } catch (error) {
                 console.warn("Background fetch failed:", error);
                 return null;
@@ -614,9 +724,13 @@
                 poemEl.style.display = 'none';
                 authorEl.style.display = 'none';
 
-                videoStatusIcon.innerText = "▶";
-                videoTimeText.innerText = "0:00 / --:--";
-                videoIndicatorEl.classList.add('visible');
+                if (memory.isLivePhoto) {
+                    videoIndicatorEl.classList.remove('visible');
+                } else {
+                    videoStatusIcon.innerText = "▶";
+                    videoTimeText.innerText = "0:00 / --:--";
+                    videoIndicatorEl.classList.add('visible');
+                }
             } else {
                 videoIndicatorEl.classList.remove('visible');
                 poemEl.innerText = memory.text ? `"${memory.text}"` : "";
@@ -649,7 +763,13 @@
         }
 
         async function updateDisplay(useHistory = false, isUserTap = false) {
-            if (isProcessing) return;
+            if (isProcessing) {
+                // If a transition is already in progress, retry shortly instead of dropping advancement
+                if (!displayTimer) {
+                    displayTimer = setTimeout(() => updateDisplay(useHistory, isUserTap), 1200);
+                }
+                return;
+            }
             isProcessing = true;
 
             try {
@@ -664,6 +784,7 @@
                         return;
                     }
                     currentMemory = memory;
+                    lastMemoryChangeTimestamp = Date.now();
                     renderOverlayText(memory);
                     hideLoader();
                     getActiveLayer().container.classList.add('active');
@@ -750,12 +871,14 @@
 
                 // If still no memory, keep current peaceful and retry in 3 seconds
                 if (!memory) {
+                    hideLoader();
                     if (displayTimer) clearTimeout(displayTimer);
                     displayTimer = setTimeout(() => updateDisplay(false, false), 3000);
                     return;
                 }
 
                 // --- 3. SEAMLESS CROSSFADE TRANSITION ---
+                hideLoader();
                 const incomingLayer = staging;
                 const outgoingLayer = getActiveLayer();
 
@@ -765,6 +888,7 @@
                 }
 
                 currentMemory = memory;
+                lastMemoryChangeTimestamp = Date.now();
                 videoEndedTriggered = false;
 
                 // If incoming is video, start playing before crossfade so first frame is active
@@ -822,6 +946,7 @@
                 }, 1200);
 
             } catch (err) {
+                hideLoader();
                 console.error("updateDisplay unexpected error:", err);
                 if (displayTimer) clearTimeout(displayTimer);
                 displayTimer = setTimeout(() => updateDisplay(false, false), 4000);
@@ -831,22 +956,25 @@
         }
 
         document.getElementById('zone-left').addEventListener('click', () => {
-            if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
+            if (menuOverlay.classList.contains('overlay-visible') || deleteOverlay.classList.contains('overlay-visible') || isProcessing) return;
             if (historyStack.length === 0) return; 
             updateDisplay(true, true); 
         });
 
         document.getElementById('zone-center').addEventListener('click', () => {
+            if (deleteOverlay.classList.contains('overlay-visible') || isProcessing) return;
             if (displayTimer) clearTimeout(displayTimer); 
             if (currentMemory && currentMemory.isVideo) {
                 try { getActiveVideo().pause(); } catch(e) {}
-                videoStatusIcon.innerText = "⏸";
+                if (!currentMemory.isLivePhoto) {
+                    videoStatusIcon.innerText = "⏸";
+                }
             }
             menuOverlay.classList.add('overlay-visible');
         });
 
         document.getElementById('zone-right').addEventListener('click', () => {
-            if (menuOverlay.classList.contains('overlay-visible') || isProcessing) return;
+            if (menuOverlay.classList.contains('overlay-visible') || deleteOverlay.classList.contains('overlay-visible') || isProcessing) return;
             updateDisplay(false, true); 
         });
 
@@ -870,7 +998,7 @@
             close: () => {
                 menuOverlay.classList.remove('overlay-visible');
                 if (displayTimer) clearTimeout(displayTimer);
-                if (currentMemory && currentMemory.isVideo) {
+                if (currentMemory && currentMemory.isVideo && !currentMemory.isLivePhoto) {
                     videoStatusIcon.innerText = "▶";
                     getActiveVideo().play().catch(e => {});
                     const dur = getActiveVideo().duration;
@@ -919,19 +1047,20 @@
 
             omit: async () => {
                 if (!currentMemory || isProcessing) return;
-                
+                const pathToOmit = decodeURIComponent(currentMemory.imagePathEncoded);
                 isProcessing = true;
                 showLoader("Omitting...", true);
+                menuActions.close();
                 
                 try {
                     const res = await fetch('/api/omit', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ currentPath: decodeURIComponent(currentMemory.imagePathEncoded) })
+                        body: JSON.stringify({ currentPath: pathToOmit })
                     });
                     
                     if (res.ok) {
-                        menuActions.close();
+                        purgeMediaFromBuffers(pathToOmit);
                         nextMemoryPromise = null;
                         isProcessing = false;
                         updateDisplay(false, true);
@@ -954,13 +1083,13 @@
                 if (currentMemory.isVideo) {
                     deletePreviewEl.style.display = 'none';
                     deletePreviewVideo.style.display = 'block';
-                    deletePreviewVideo.src = currentMemory.mediaSrc || `/api/media?path=${currentMemory.imagePathEncoded}`;
+                    deletePreviewVideo.src = currentMemory.mediaUrl || `/api/media?path=${currentMemory.imagePathEncoded}`;
                 } else {
                     deletePreviewVideo.style.display = 'none';
                     deletePreviewVideo.removeAttribute('src');
                     deletePreviewVideo.load();
                     deletePreviewEl.style.display = 'block';
-                    deletePreviewEl.src = currentMemory.imageSrc || `/api/image?path=${currentMemory.imagePathEncoded}`;
+                    deletePreviewEl.src = currentMemory.mediaUrl || `/api/image?path=${currentMemory.imagePathEncoded}`;
                 }
                 deleteOverlay.classList.add('overlay-visible');
             },
@@ -978,18 +1107,25 @@
 
             doDelete: async () => {
                 if (!currentMemory || isProcessing) return;
+                const pathToDelete = decodeURIComponent(currentMemory.imagePathEncoded);
                 isProcessing = true;
                 showLoader("Deleting...", true);
+                
+                // Immediately teardown delete preview video and dismiss modal
+                try { deletePreviewVideo.pause(); } catch(e) {}
+                deletePreviewVideo.removeAttribute('src');
+                deletePreviewVideo.load();
+                deleteOverlay.classList.remove('overlay-visible');
                 
                 try {
                     const res = await fetch('/api/photo', {
                         method: 'DELETE',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ currentPath: decodeURIComponent(currentMemory.imagePathEncoded) })
+                        body: JSON.stringify({ currentPath: pathToDelete })
                     });
                     
                     if (res.ok) {
-                        deleteOverlay.classList.remove('overlay-visible');
+                        purgeMediaFromBuffers(pathToDelete);
                         nextMemoryPromise = null; 
                         isProcessing = false; 
                         updateDisplay(false, true); 
@@ -1007,10 +1143,28 @@
             },
 
             reload: () => window.location.reload(),
+            reboot: async () => {
+                if (confirm("Restart device?")) {
+                    showLoader("Restarting Device...", true);
+                    try {
+                        await fetch('/api/reboot', { method: 'POST' });
+                    } catch (e) {
+                        console.warn("Reboot API failed:", e);
+                    }
+                }
+            },
             exit: async () => {
-                if (confirm("Exit?")) {
+                if (confirm("Exit app?")) {
                     showLoader("Shutting Down...", true);
-                    await fetch('/api/exit', { method: 'POST' });
+                    try {
+                        await fetch('/api/exit', { method: 'POST' });
+                    } catch (e) {
+                        console.warn("Exit API failed:", e);
+                    }
+                    setTimeout(() => {
+                        try { window.close(); } catch(e) {}
+                        hideLoader();
+                    }, 3000);
                 }
             }
         };
@@ -1098,6 +1252,20 @@
         // Initialize weather and update periodically every 10 minutes
         updateWeather();
         setInterval(updateWeather, 10 * 60 * 1000);
+
+        // Self-Healing Watchdog: Ensures frame never stays stuck indefinitely on any memory or hung state
+        setInterval(() => {
+            const now = Date.now();
+            const maxWait = Math.max(currentInterval * 3, 90000);
+            if (now - lastMemoryChangeTimestamp > maxWait) {
+                console.warn("⚠️ Display watchdog triggered: Memory stalled for too long. Forcing advancement...");
+                hideLoader();
+                isProcessing = false;
+                nextMemoryPromise = null;
+                lastMemoryChangeTimestamp = now;
+                updateDisplay(false, false);
+            }
+        }, 15000);
 
         // Start App
         updateDisplay();

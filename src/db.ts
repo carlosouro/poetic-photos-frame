@@ -40,6 +40,7 @@ let getQuoteStmt: Database.Statement;
 let insertQuoteStmt: Database.Statement;
 let deleteQuoteStmt: Database.Statement;
 let hasDuplicateQuoteStmt: Database.Statement;
+let countDuplicateQuoteStmt: Database.Statement;
 
 export function parseDateParts(dateStr: string): { month: number; day: number } {
     const d = new Date(dateStr);
@@ -88,7 +89,7 @@ export function initDatabase(dbPath?: string): Database.Database {
 
         CREATE TABLE IF NOT EXISTS quotes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            photo_path TEXT UNIQUE NOT NULL REFERENCES photos(path) ON DELETE CASCADE,
+            photo_path TEXT UNIQUE NOT NULL REFERENCES photos(path) ON DELETE CASCADE ON UPDATE CASCADE,
             content TEXT NOT NULL,
             type TEXT NOT NULL DEFAULT 'quote',
             author TEXT NOT NULL,
@@ -157,6 +158,10 @@ export function initDatabase(dbPath?: string): Database.Database {
 
     hasDuplicateQuoteStmt = db.prepare(`
         SELECT 1 FROM quotes WHERE content = ? AND photo_path != ? LIMIT 1
+    `);
+
+    countDuplicateQuoteStmt = db.prepare(`
+        SELECT COUNT(*) as count FROM quotes WHERE content = ? AND photo_path != ?
     `);
 
     // Auto-seed from JSON cache files if database was newly created
@@ -248,6 +253,7 @@ export function removePhoto(filePath: string): void {
 export function renamePhoto(oldPath: string, newPath: string): void {
     const isFav = checkIsFavorite(newPath);
     db.transaction(() => {
+        db.pragma('defer_foreign_keys = ON');
         renamePhotoStmt.run(newPath, isFav, oldPath);
         // Cascading update for quote if present
         db.prepare('UPDATE quotes SET photo_path = ? WHERE photo_path = ?').run(newPath, oldPath);
@@ -269,6 +275,11 @@ export function deleteQuote(photoPath: string): void {
 export function hasDuplicateQuote(content: string, excludePath: string = ''): boolean {
     const res = hasDuplicateQuoteStmt.get(content, excludePath);
     return !!res;
+}
+
+export function getDuplicateQuoteCount(content: string, excludePath: string = ''): number {
+    const res = countDuplicateQuoteStmt.get(content, excludePath) as { count: number } | undefined;
+    return res ? res.count : 0;
 }
 
 export function migrateQuote(duplicatePath: string, survivorPath: string): void {

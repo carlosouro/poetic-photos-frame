@@ -10,6 +10,11 @@ import { exec, fork } from 'child_process';
 import { promisify } from 'util';
 import crypto from 'crypto';
 
+// Disable libvips mmap file caching to prevent Bus Error (SIGBUS) when NAS CIFS disconnects
+try {
+    sharp.cache(false);
+} catch (e) {}
+
 const execAsync = promisify(exec);
 
 dotenv.config();
@@ -57,6 +62,7 @@ import {
     setQuote,
     deleteQuote,
     hasDuplicateQuote,
+    getDuplicateQuoteCount,
     migrateQuote,
     Photo,
     QuoteEntry
@@ -78,9 +84,10 @@ const MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024;
 // Display & Video Optimization Configuration
 const FRAME_SCREEN_WIDTH = parseInt(process.env.FRAME_SCREEN_WIDTH || '1280', 10);
 const FRAME_SCREEN_HEIGHT = parseInt(process.env.FRAME_SCREEN_HEIGHT || '800', 10);
-const MAX_VIDEO_DURATION_SECONDS = parseInt(process.env.MAX_VIDEO_DURATION_SECONDS || '30', 10);
+const MAX_VIDEO_DURATION_SECONDS = parseInt(process.env.MAX_VIDEO_DURATION_SECONDS || '20', 10);
 const VIDEO_CACHE_DIR = path.resolve(process.env.VIDEO_CACHE_DIR || path.join(CACHE_DIR, 'transcoded'));
-const VIDEO_CACHE_MAX_FILES = 100;
+const VIDEO_CACHE_MAX_FILES = parseInt(process.env.VIDEO_CACHE_MAX_FILES || '1500', 10);
+const VIDEO_CACHE_MAX_SIZE_BYTES = parseInt(process.env.VIDEO_CACHE_MAX_SIZE_GB || '10', 10) * 1024 * 1024 * 1024;
 
 if (!fs.existsSync(VIDEO_CACHE_DIR)) {
     fs.mkdirSync(VIDEO_CACHE_DIR, { recursive: true });
@@ -90,7 +97,7 @@ const activeTranscodes = new Map<string, Promise<string>>();
 
 const getVideoCacheKey = (filePath: string, mtimeMs: number): string => {
     return crypto.createHash('sha256')
-        .update(`${filePath}:${mtimeMs}:${FRAME_SCREEN_WIDTH}x${FRAME_SCREEN_HEIGHT}:${MAX_VIDEO_DURATION_SECONDS}`)
+        .update(`v2:${filePath}:${mtimeMs}:${FRAME_SCREEN_WIDTH}x${FRAME_SCREEN_HEIGHT}:${MAX_VIDEO_DURATION_SECONDS}`)
         .digest('hex')
         .substring(0, 24);
 };
@@ -116,28 +123,43 @@ const cleanupVideoCache = async (): Promise<void> => {
     try {
         const files = await fsPromises.readdir(VIDEO_CACHE_DIR);
         const mp4Files = files.filter(f => f.endsWith('.mp4') && !f.endsWith('.tmp.mp4'));
-        if (mp4Files.length <= VIDEO_CACHE_MAX_FILES) return;
 
         const fileStats = await Promise.all(
             mp4Files.map(async f => {
                 const fullPath = path.join(VIDEO_CACHE_DIR, f);
                 try {
                     const st = await fsPromises.stat(fullPath);
-                    return { fullPath, mtime: st.mtimeMs };
+                    return { fullPath, mtime: st.mtimeMs, size: st.size };
                 } catch {
                     return null;
                 }
             })
         );
 
-        const validStats = fileStats.filter((item): item is { fullPath: string; mtime: number } => item !== null);
-        validStats.sort((a, b) => a.mtime - b.mtime); // Oldest first
+        const validStats = fileStats.filter((item): item is { fullPath: string; mtime: number; size: number } => item !== null);
+        let totalSize = validStats.reduce((sum, item) => sum + item.size, 0);
 
-        const toDeleteCount = validStats.length - Math.floor(VIDEO_CACHE_MAX_FILES * 0.85); // Prune to 85%
-        for (let i = 0; i < toDeleteCount; i++) {
-            await fsPromises.unlink(validStats[i].fullPath).catch(() => {});
+        if (validStats.length <= VIDEO_CACHE_MAX_FILES && totalSize <= VIDEO_CACHE_MAX_SIZE_BYTES) {
+            return;
         }
-        console.log(`🧹 Video cache cleaned up: removed ${toDeleteCount} older cached clips.`);
+
+        validStats.sort((a, b) => a.mtime - b.mtime); // Oldest accessed first
+
+        let deletedCount = 0;
+        for (const item of validStats) {
+            if (validStats.length - deletedCount <= Math.floor(VIDEO_CACHE_MAX_FILES * 0.9) &&
+                totalSize <= Math.floor(VIDEO_CACHE_MAX_SIZE_BYTES * 0.9)) {
+                break;
+            }
+            try {
+                await fsPromises.unlink(item.fullPath);
+                totalSize -= item.size;
+                deletedCount++;
+            } catch {}
+        }
+        if (deletedCount > 0) {
+            console.log(`🧹 Video cache cleaned up: removed ${deletedCount} older cached clips (current size: ${(totalSize / (1024 * 1024)).toFixed(1)} MB).`);
+        }
     } catch (e) {
         console.warn("⚠️ Video cache cleanup error:", e);
     }
@@ -176,6 +198,7 @@ const ensureOptimizedVideo = async (filePath: string): Promise<string> => {
             let codec = '';
             let width = 0;
             let height = 0;
+            let srcFps = 30;
 
             try {
                 const { stdout } = await execAsync(probeCmd);
@@ -185,8 +208,25 @@ const ensureOptimizedVideo = async (filePath: string): Promise<string> => {
                 codec = stream?.codec_name || '';
                 width = parseInt(stream?.width || '0', 10);
                 height = parseInt(stream?.height || '0', 10);
+                if (stream?.r_frame_rate) {
+                    const parts = stream.r_frame_rate.split('/');
+                    if (parts.length === 2 && parseFloat(parts[1]) > 0) {
+                        srcFps = parseFloat(parts[0]) / parseFloat(parts[1]);
+                    } else if (parts.length === 1) {
+                        srcFps = parseFloat(parts[0]);
+                    }
+                }
             } catch (probeErr) {
                 console.warn(`⚠️ ffprobe failed for ${path.basename(filePath)}:`, probeErr);
+            }
+
+            // Dynamic framerate selection:
+            // 60fps for high-framerate source (iPhone 60fps / 59.94fps); preserve 24/30fps for cinematic/standard clips
+            let targetFps = 30;
+            if (srcFps >= 45) {
+                targetFps = 60;
+            } else if (srcFps > 0 && srcFps < 35) {
+                targetFps = Math.round(srcFps);
             }
 
             let startTime = 0;
@@ -198,10 +238,10 @@ const ensureOptimizedVideo = async (filePath: string): Promise<string> => {
 
             const tempPath = path.join(VIDEO_CACHE_DIR, `${cacheKey}.tmp.mp4`);
 
-            console.log(`🎬 Optimizing video: ${path.basename(filePath)} (${codec || 'unknown'}, ${width}x${height}, dur: ${duration.toFixed(1)}s -> clip ${clipDuration}s from ${startTime}s, target: <=${FRAME_SCREEN_WIDTH}x${FRAME_SCREEN_HEIGHT} @ 30fps)...`);
+            console.log(`🎬 Optimizing video: ${path.basename(filePath)} (${codec || 'unknown'}, ${width}x${height}, src: ${srcFps.toFixed(1)}fps, dur: ${duration.toFixed(1)}s -> clip ${clipDuration}s from ${startTime}s, target: <=${FRAME_SCREEN_WIDTH}x${FRAME_SCREEN_HEIGHT} @ ${targetFps}fps)...`);
 
-            const scaleFilter = `scale=${FRAME_SCREEN_WIDTH}:${FRAME_SCREEN_HEIGHT}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
-            const ffmpegCmd = `nice -n 15 ffmpeg -y -ss ${startTime} -t ${clipDuration} -i "${filePath}" -vf "${scaleFilter}" -r 30 -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -threads 2 -movflags +faststart "${tempPath}"`;
+            const scaleFilter = `scale=${FRAME_SCREEN_WIDTH}:${FRAME_SCREEN_HEIGHT}:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p`;
+            const ffmpegCmd = `nice -n 15 ffmpeg -y -ss ${startTime} -t ${clipDuration} -i "${filePath}" -vf "${scaleFilter}" -r ${targetFps} -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -threads 2 -movflags +faststart "${tempPath}"`;
 
             await execAsync(ffmpegCmd);
 
@@ -211,7 +251,7 @@ const ensureOptimizedVideo = async (filePath: string): Promise<string> => {
             }
 
             await fsPromises.rename(tempPath, cachedPath);
-            console.log(`✅ Video optimized and cached: ${cacheKey}.mp4 (${(tempStat.size / (1024 * 1024)).toFixed(2)} MB)`);
+            console.log(`✅ Video optimized and cached: ${cacheKey}.mp4 (${(tempStat.size / (1024 * 1024)).toFixed(2)} MB, ${targetFps}fps)`);
 
             cleanupVideoCache().catch(() => {});
 
@@ -467,10 +507,37 @@ setInterval(() => {
 
 // --- API LOGIC ---
 
-async function fileToGenerativePart(filePath: string, mimeType = "image/jpeg") {
+const RECENT_QUOTES_LIMIT = 50;
+const OVERUSED_QUOTE_THRESHOLD = 5;
+const recentDisplayedQuotes: string[] = [];
+
+function rememberDisplayedQuote(content: string) {
+    const trimmed = content?.trim();
+    if (!trimmed) return;
+    const existingIdx = recentDisplayedQuotes.indexOf(trimmed);
+    if (existingIdx !== -1) {
+        recentDisplayedQuotes.splice(existingIdx, 1);
+    }
+    recentDisplayedQuotes.push(trimmed);
+    if (recentDisplayedQuotes.length > RECENT_QUOTES_LIMIT) {
+        recentDisplayedQuotes.shift();
+    }
+}
+
+function getImageMimeType(filePath: string): string {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.png') return 'image/png';
+    if (ext === '.webp') return 'image/webp';
+    return 'image/jpeg';
+}
+
+async function fileToGenerativePart(filePath: string) {
+    // Read file into Buffer to avoid libvips mmap SIGBUS on remote CIFS/NFS mounts
+    const fileBuffer = await fsPromises.readFile(filePath);
     try {
+        // failOn: 'none' gracefully recovers slightly truncated/corrupt JPEGs into valid JPEGs
         // Downscale image to max 1024x1024 to drop base64 payload from 15MB+ to ~150KB
-        const resizedBuffer = await sharp(filePath)
+        const resizedBuffer = await sharp(fileBuffer, { failOn: 'none' })
             .rotate() // preserve EXIF orientation
             .resize(1024, 1024, { fit: 'inside', withoutEnlargement: true })
             .jpeg({ quality: 80 })
@@ -480,22 +547,27 @@ async function fileToGenerativePart(filePath: string, mimeType = "image/jpeg") {
             data: resizedBuffer.toString("base64"),
             mimeType: "image/jpeg"
         };
-    } catch (sharpError) {
-        console.warn(`⚠️ Sharp resizing failed for ${path.basename(filePath)}, using raw file fallback:`, sharpError);
-        const data = await fsPromises.readFile(filePath);
+    } catch (sharpError: any) {
+        const msg = sharpError?.message || String(sharpError);
+        // Never send unreadable/corrupt bytes to Gemini (triggers 400 INVALID_ARGUMENT)
+        if (/premature end|corrupt|unsupported image format|input buffer contains unsupported/i.test(msg)) {
+            throw new Error(`Unreadable image (${path.basename(filePath)}): ${msg}`);
+        }
+        console.warn(`⚠️ Sharp resizing failed for ${path.basename(filePath)}, using buffer fallback:`, msg);
         return {
-            data: data.toString("base64"),
-            mimeType
+            data: fileBuffer.toString("base64"),
+            mimeType: getImageMimeType(filePath)
         };
     }
 }
 
 async function generateWithRetry(prompt: string, imagePart: { data: string; mimeType: string }, retries = 3, delay = 1000): Promise<QuoteEntry> {
+    let timeoutHandle: NodeJS.Timeout | undefined;
     try {
-        // Enforce a strict 20-second timeout on Gemini API calls so network drops don't hang the app forever
-        const timeoutPromise = new Promise<never>((_, reject) => 
-            setTimeout(() => reject(new Error("Gemini API Timeout")), 20000)
-        );
+        // Enforce a strict 25-second timeout on Gemini API calls so network drops don't hang the app forever
+        const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(() => reject(new Error("Gemini API Timeout")), 25000);
+        });
 
         const apiCall = ai.models.generateContent({
             model: modelName,
@@ -509,6 +581,9 @@ async function generateWithRetry(prompt: string, imagePart: { data: string; mime
                 }
             ],
             config: {
+                thinkingConfig: {
+                    thinkingBudget: 0
+                },
                 responseMimeType: 'application/json',
                 responseSchema: {
                     type: 'OBJECT',
@@ -527,10 +602,21 @@ async function generateWithRetry(prompt: string, imagePart: { data: string; mime
             ? result.text()
             : (typeof result.text === 'string' ? result.text : (result.candidates?.[0]?.content?.parts?.[0]?.text || ''));
         const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        if (!cleanText) {
+            const finishReason = result.candidates?.[0]?.finishReason || 'EMPTY_RESPONSE';
+            throw new Error(`Gemini returned empty response (${finishReason})`);
+        }
         const parsed = JSON.parse(cleanText) as QuoteEntry;
-        return parsed;
+        if (!parsed?.content?.trim() || !parsed?.author?.trim()) {
+            throw new Error('Gemini returned incomplete quote payload');
+        }
+        return {
+            content: parsed.content.trim(),
+            type: 'quote',
+            author: parsed.author.trim()
+        };
     } catch (error: any) {
-        if (error.message?.includes('404')) throw error;
+        if (error.message?.includes('404') || error.status === 400) throw error;
 
         // Catch timeouts and fetch failures to trigger retries cleanly
         if (retries > 0 && (error.message?.includes('503') || error.message?.includes('overloaded') || error.message?.includes('Timeout') || error.message?.includes('fetch failed'))) {
@@ -539,6 +625,8 @@ async function generateWithRetry(prompt: string, imagePart: { data: string; mime
             return generateWithRetry(prompt, imagePart, retries - 1, delay * 2);
         }
         throw error;
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
     }
 }
 
@@ -677,13 +765,15 @@ app.get('/api/next-memory', async (req, res) => {
         let duplicateDetected = false;
         let textToExclude = "";
 
-        // 2. CHECK CACHE & DETECT DUPLICATES
+        // 2. CHECK CACHE & DETECT OVERUSED / RECENTLY SHOWN DUPLICATES
         const cachedEntry = getQuote(selectedPhoto.path);
         if (cachedEntry) {
-            if (hasDuplicateQuote(cachedEntry.content, selectedPhoto.path)) {
+            const recentlyShown = recentDisplayedQuotes.includes(cachedEntry.content.trim());
+            const duplicateCount = getDuplicateQuoteCount(cachedEntry.content, selectedPhoto.path);
+            if (recentlyShown || duplicateCount >= OVERUSED_QUOTE_THRESHOLD) {
                 duplicateDetected = true;
                 textToExclude = cachedEntry.content;
-                console.log(`♻️  Duplicate quote content detected for ${path.basename(selectedPhoto.path)}. Refreshing...`);
+                console.log(`♻️  Refreshing ${recentlyShown ? 'recently shown' : `overused (${duplicateCount + 1}x)`} quote for ${path.basename(selectedPhoto.path)}...`);
             } else {
                 aiResponse = cachedEntry;
             }
@@ -704,9 +794,14 @@ app.get('/api/next-memory', async (req, res) => {
             } else {
                 isGeneratingAI = true; 
                 
+                const excludedQuotes = new Set<string>();
+                if (duplicateDetected && textToExclude) excludedQuotes.add(textToExclude);
+                for (const q of recentDisplayedQuotes.slice(-5)) excludedQuotes.add(q);
+
                 let exclusionInstruction = "";
-                if (duplicateDetected && textToExclude) {
-                    exclusionInstruction = `IMPORTANT: The following quote was already used. Do NOT use it again: "${textToExclude}". Find a completely different quote.`;
+                if (excludedQuotes.size > 0) {
+                    const list = Array.from(excludedQuotes).map(q => `"${q}"`).join('; ');
+                    exclusionInstruction = `IMPORTANT: Do NOT use any of these recently/overused quotes: ${list}. Choose a distinct, less clichéd quote.`;
                 }
 
                 const photoDate = new Date(selectedPhoto.created);
@@ -727,6 +822,7 @@ app.get('/api/next-memory', async (req, res) => {
 
                     Directives:
                     - Only real, authentic, existing quotes. Can be a widely famous quote, or a lesser-known quote if it captures the moment and emotional mood better.
+                    - Avoid overly clichéd quotes; favor fresh, evocative literary quotes that match specific visual details of the scene.
                     - DO NOT compose your own poem, rhymes, or AI-generated prose.
                     - Provide the author in the 'author' field (e.g. Fernando Pessoa, Oscar Wilde, Albert Einstein, Sophia de Mello Breyner Andresen, Victor Hugo, Ralph Waldo Emerson, Clarice Lispector, etc.).
                     - If the quote is of unknown origin or traditional/folk wisdom, set author to "Anonymous", "Unknown", "Proverb", or "Provérbio Popular" / "Anónimo".
@@ -734,21 +830,23 @@ app.get('/api/next-memory', async (req, res) => {
                 `;
 
                 try {
-                    const imagePart = await fileToGenerativePart(selectedPhoto.path, "image/jpeg");
+                    const imagePart = await fileToGenerativePart(selectedPhoto.path);
                     aiResponse = await generateWithRetry(prompt, imagePart);
                     if (aiResponse) {
                         setQuote(selectedPhoto.path, aiResponse);
                     }
-                } catch (aiError) {
-                    console.error("Gemini Final Error:", aiError);
+                } catch (aiError: any) {
+                    console.error("Gemini Final Error:", aiError?.message || aiError);
                     if (!aiResponse) {
-                        aiResponse = { content: "O valor das coisas não está no tempo que elas duram, mas na intensidade com que acontecem.", type: "quote", author: "Fernando Pessoa" };
+                        aiResponse = cachedEntry || { content: "O valor das coisas não está no tempo que elas duram, mas na intensidade com que acontecem.", type: "quote", author: "Fernando Pessoa" };
                     }
                 } finally {
                     isGeneratingAI = false; 
                 }
             }
         }
+
+        rememberDisplayedQuote(aiResponse!.content);
 
         res.json({
             text: aiResponse!.content,
@@ -819,6 +917,11 @@ const handleMediaServing = async (req: express.Request, res: express.Response) =
         headers: {
             'Content-Type': contentType,
             'Accept-Ranges': 'bytes'
+        }
+    }, (err: any) => {
+        if (err && !res.headersSent) {
+            console.warn(`⚠️ Failed to send media file ${path.basename(filePath)}:`, err.message);
+            res.status(err.status || 500).end();
         }
     });
 };
@@ -949,11 +1052,17 @@ app.get('/api/duplicates', async (req, res) => {
 });
 
 app.post('/api/exit', (req, res) => {
-
     res.json({ message: 'Shutting down...' });
-    exec('killall chromium-browser', () => {}); 
-    exec('killall chromium', () => {});
+    // Terminate all chromium kiosk processes cleanly
+    exec('pkill -f chromium 2>/dev/null; killall -9 chromium chromium-browser 2>/dev/null', () => {}); 
     setTimeout(() => process.exit(0), 1000);
+});
+
+app.post('/api/reboot', (req, res) => {
+    res.json({ message: 'Rebooting system...' });
+    exec('sudo -n systemctl reboot || sudo -n reboot', (err) => {
+        if (err) console.error('❌ Reboot command failed:', err.message);
+    });
 });
 
 app.post('/api/reindex', (req, res) => {

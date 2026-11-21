@@ -32,7 +32,7 @@ db.exec(`
 
     CREATE TABLE IF NOT EXISTS quotes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        photo_path TEXT UNIQUE NOT NULL REFERENCES photos(path) ON DELETE CASCADE,
+        photo_path TEXT UNIQUE NOT NULL REFERENCES photos(path) ON DELETE CASCADE ON UPDATE CASCADE,
         content TEXT NOT NULL,
         type TEXT NOT NULL DEFAULT 'quote',
         author TEXT NOT NULL,
@@ -134,9 +134,23 @@ const hasDupQuote = db.prepare('SELECT 1 FROM quotes WHERE content = ? AND photo
 console.log(`✅ Duplicate quote content detected:`, !!hasDupQuote);
 if (!hasDupQuote) throw new Error('Duplicate quote detection failed');
 
-// 5. Cascade Delete Test
-db.prepare('DELETE FROM photos WHERE path = ?').run('/photos/old_random.jpg');
-const orphanQuote = db.prepare('SELECT * FROM quotes WHERE photo_path = ?').get('/photos/old_random.jpg');
+// 5. Rename Photo with Quote (Favoriting simulation)
+const renamePhotoStmt = db.prepare('UPDATE photos SET path = ?, is_favorite = ? WHERE path = ?');
+const renamePhoto = db.transaction((oldPath, newPath) => {
+    db.pragma('defer_foreign_keys = ON');
+    renamePhotoStmt.run(newPath, checkIsFavorite(newPath), oldPath);
+    db.prepare('UPDATE quotes SET photo_path = ? WHERE photo_path = ?').run(newPath, oldPath);
+});
+
+renamePhoto('/photos/old_random.jpg', '/photos/_photoframe_defaults/old_random.jpg');
+const renamedPhoto = db.prepare('SELECT * FROM photos WHERE path = ?').get('/photos/_photoframe_defaults/old_random.jpg');
+const migratedQuote = db.prepare('SELECT * FROM quotes WHERE photo_path = ?').get('/photos/_photoframe_defaults/old_random.jpg');
+console.log(`✅ Rename photo (favorite) with quote verified: photo is_favorite=${renamedPhoto?.is_favorite}, quote author="${migratedQuote?.author}"`);
+if (!renamedPhoto || renamedPhoto.is_favorite !== 1 || !migratedQuote) throw new Error('Rename photo with quote failed');
+
+// 6. Cascade Delete Test
+db.prepare('DELETE FROM photos WHERE path = ?').run('/photos/_photoframe_defaults/old_random.jpg');
+const orphanQuote = db.prepare('SELECT * FROM quotes WHERE photo_path = ?').get('/photos/_photoframe_defaults/old_random.jpg');
 console.log(`✅ Cascade delete verified. Orphan quote exists:`, !!orphanQuote);
 if (orphanQuote) throw new Error('Cascade delete failed');
 
